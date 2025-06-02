@@ -9,6 +9,21 @@ class MapWidget(QWidget):
     def __init__(self, records, params):
         super().__init__()
         self.records = records
+        if ("position_lat" in records and "position_long" in records):
+            self.has_gps = True
+            # Filter out records with no position data
+            records = records.dropna(subset=["position_lat", "position_long"])
+            self.route_points = list(
+                zip(records["position_lat"], records["position_long"])
+            )
+            self.route_timestamps = records["timestamp"].tolist()
+            self.center_lat = records["position_lat"].mean()
+            self.center_lon = records["position_long"].mean()
+            if not self.route_points:
+                self.has_gps = False
+        else:
+            self.has_gps = False
+
         self.lap_data = []
         self.selected_laps = []
         self.layout = QVBoxLayout(self)
@@ -31,33 +46,11 @@ class MapWidget(QWidget):
         """Create and display a map from FIT file GPS data"""
         # Create a folium map
 
-        # Check if we have position data
-        if (
-            "position_lat" not in self.records.columns
-            or "position_long" not in self.records.columns
-        ):
-            # No GPS data available
+        if not self.has_gps:
             return
-
-        # Filter out self.records with no position data
-        self.records = self.records.dropna(subset=["position_lat", "position_long"])
-
-        if self.records.empty:
-            # No valid GPS data
-            return
-
-        # Default center point of activity
-        center_lat = self.records["position_lat"].mean()
-        center_lon = self.records["position_long"].mean()
 
         # Create map centered on activity
-        m = folium.Map(location=[center_lat, center_lon], zoom_start=12)
-
-        # Full track route points
-        route_points = list(zip(self.records["position_lat"], self.records["position_long"]))
-
-        # Get timestamps for all points for easier matching
-        all_timestamps = self.records["timestamp"].tolist()
+        m = folium.Map(location=[self.center_lat, self.center_lon], zoom_start=12)
 
         # Initialize selected_lap_points regardless of whether laps are selected
         selected_lap_points = []
@@ -65,13 +58,13 @@ class MapWidget(QWidget):
         # If no laps are selected, draw the full track as solid blue
         if not self.selected_laps:
             folium.PolyLine(
-                route_points, color="#4363d8", weight=4, opacity=1.0
+                self.route_points, color="#4363d8", weight=4, opacity=1.0
             ).add_to(m)
         else:
             # We have selected laps - need to identify selected vs non-selected portions
 
             # Create a mask to mark which points belong to selected laps
-            selected_mask = [False] * len(self.records)
+            selected_mask = [False] * len(self.route_points)
 
             # Mark all points that belong to selected laps
             for lap_number in self.selected_laps:
@@ -84,10 +77,10 @@ class MapWidget(QWidget):
 
                 if lap_info and "start_time" in lap_info and "end_time" in lap_info:
                     # Mark all points in this lap as selected
-                    for i, timestamp in enumerate(all_timestamps):
+                    for i, timestamp in enumerate(self.route_timestamps):
                         if lap_info["start_time"] <= timestamp <= lap_info["end_time"]:
                             selected_mask[i] = True
-                            selected_lap_points.append(route_points[i])
+                            selected_lap_points.append(self.route_points[i])
 
             # Now draw non-selected parts (dashed blue with reduced opacity)
             non_selected_segments = []
@@ -96,7 +89,7 @@ class MapWidget(QWidget):
             for i, selected in enumerate(selected_mask):
                 if not selected:
                     # Add to current non-selected segment
-                    current_segment.append(route_points[i])
+                    current_segment.append(self.route_points[i])
                 else:
                     # End of non-selected segment
                     if current_segment:
@@ -125,7 +118,7 @@ class MapWidget(QWidget):
             for i, selected in enumerate(selected_mask):
                 if selected:
                     # Add to current selected segment
-                    current_segment.append(route_points[i])
+                    current_segment.append(self.route_points[i])
                 else:
                     # End of selected segment
                     if current_segment:
@@ -160,11 +153,11 @@ class MapWidget(QWidget):
                     start_point = None
                     end_point = None
 
-                    for i, timestamp in enumerate(all_timestamps):
+                    for i, timestamp in enumerate(self.route_timestamps):
                         if lap_info["start_time"] <= timestamp <= lap_info["end_time"]:
                             if start_point is None:
-                                start_point = route_points[i]
-                            end_point = route_points[i]
+                                start_point = self.route_points[i]
+                            end_point = self.route_points[i]
 
                     if start_point and end_point:
                         # Start marker
@@ -185,7 +178,7 @@ class MapWidget(QWidget):
         try:
             # If we have selected laps, zoom to them, otherwise zoom to full route
             points_to_zoom = (
-                selected_lap_points if selected_lap_points else route_points
+                selected_lap_points if selected_lap_points else self.route_points
             )
 
             if points_to_zoom:
