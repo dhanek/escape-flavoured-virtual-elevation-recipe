@@ -51,9 +51,9 @@ class AnalysisWindow(QMainWindow):
         left_layout = QVBoxLayout()
 
         # Add map widget if GPS data is available
-        if self.fit_file.has_gps:
-            self.map_widget = MapWidget(self.fit_file.resampled_df,
-                                        self.file_settings)
+        self.map_widget = MapWidget(self.fit_file.resampled_df,
+                                    self.file_settings)
+        if self.map_widget.has_gps:
             self.map_widget.update()
             left_layout.addWidget(self.map_widget, 2)
         else:
