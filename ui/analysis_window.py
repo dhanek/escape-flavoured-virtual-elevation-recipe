@@ -52,7 +52,8 @@ class AnalysisWindow(QMainWindow):
 
         # Add map widget if GPS data is available
         if self.fit_file.has_gps:
-            self.map_widget = MapWidget(self.fit_file, self.file_settings)
+            self.map_widget = MapWidget(self.fit_file.resampled_df,
+                                        self.file_settings)
             self.map_widget.update()
             left_layout.addWidget(self.map_widget, 2)
         else:
@@ -276,7 +277,8 @@ class AnalysisWindow(QMainWindow):
 
         # Update the map to show selected laps
         if self.fit_file.has_gps:
-            self.map_widget.set_selected_laps(self.selected_laps)
+            self.map_widget.set_selected_laps(self.fit_file.get_lap_data(),
+                                              self.selected_laps)
             self.map_widget.update()
 
     def toggle_lap_selection(self):

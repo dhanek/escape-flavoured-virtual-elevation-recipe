@@ -6,9 +6,10 @@ from PySide6.QtWidgets import QVBoxLayout, QWidget
 
 
 class MapWidget(QWidget):
-    def __init__(self, fit_file, params):
+    def __init__(self, records, params):
         super().__init__()
-        self.fit_file = fit_file
+        self.records = records
+        self.lap_data = []
         self.selected_laps = []
         self.layout = QVBoxLayout(self)
         self.webview = QWebEngineView()
@@ -17,8 +18,9 @@ class MapWidget(QWidget):
         self.wind_speed = params.get("wind_speed", None)
         self.wind_direction = params.get("wind_direction", None)
 
-    def set_selected_laps(self, selected_laps):
+    def set_selected_laps(self, lap_data, selected_laps):
         """Update the selected laps and redraw the map"""
+        self.lap_data = lap_data
         self.selected_laps = selected_laps
 
     def set_wind(self, wind_speed, wind_direction):
@@ -28,38 +30,34 @@ class MapWidget(QWidget):
     def update(self):
         """Create and display a map from FIT file GPS data"""
         # Create a folium map
-        records = self.fit_file.resampled_df
 
         # Check if we have position data
         if (
-            "position_lat" not in records.columns
-            or "position_long" not in records.columns
+            "position_lat" not in self.records.columns
+            or "position_long" not in self.records.columns
         ):
             # No GPS data available
             return
 
-        # Filter out records with no position data
-        records = records.dropna(subset=["position_lat", "position_long"])
+        # Filter out self.records with no position data
+        self.records = self.records.dropna(subset=["position_lat", "position_long"])
 
-        if records.empty:
+        if self.records.empty:
             # No valid GPS data
             return
 
         # Default center point of activity
-        center_lat = records["position_lat"].mean()
-        center_lon = records["position_long"].mean()
+        center_lat = self.records["position_lat"].mean()
+        center_lon = self.records["position_long"].mean()
 
         # Create map centered on activity
         m = folium.Map(location=[center_lat, center_lon], zoom_start=12)
 
-        # Get lap data
-        lap_data = self.fit_file.get_lap_data()
-
         # Full track route points
-        route_points = list(zip(records["position_lat"], records["position_long"]))
+        route_points = list(zip(self.records["position_lat"], self.records["position_long"]))
 
         # Get timestamps for all points for easier matching
-        all_timestamps = records["timestamp"].tolist()
+        all_timestamps = self.records["timestamp"].tolist()
 
         # Initialize selected_lap_points regardless of whether laps are selected
         selected_lap_points = []
@@ -73,13 +71,13 @@ class MapWidget(QWidget):
             # We have selected laps - need to identify selected vs non-selected portions
 
             # Create a mask to mark which points belong to selected laps
-            selected_mask = [False] * len(records)
+            selected_mask = [False] * len(self.records)
 
             # Mark all points that belong to selected laps
             for lap_number in self.selected_laps:
-                # Find the lap in lap_data
+                # Find the lap in self.lap_data
                 lap_info = None
-                for lap in lap_data:
+                for lap in self.lap_data:
                     if lap["lap_number"] == lap_number:
                         lap_info = lap
                         break
@@ -150,9 +148,9 @@ class MapWidget(QWidget):
 
             # Add markers for the start and end of each selected lap
             for lap_number in self.selected_laps:
-                # Find the lap in lap_data
+                # Find the lap in self.lap_data
                 lap_info = None
-                for lap in lap_data:
+                for lap in self.lap_data:
                     if lap["lap_number"] == lap_number:
                         lap_info = lap
                         break
