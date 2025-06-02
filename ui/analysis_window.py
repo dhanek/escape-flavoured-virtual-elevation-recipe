@@ -52,7 +52,8 @@ class AnalysisWindow(QMainWindow):
 
         # Add map widget if GPS data is available
         if self.fit_file.has_gps:
-            self.map_widget = MapWidget(self.fit_file, self.settings)
+            self.map_widget = MapWidget(self.fit_file, self.file_settings)
+            self.map_widget.update()
             left_layout.addWidget(self.map_widget, 2)
         else:
             no_gps_label = QLabel("No GPS data available in this FIT file")
@@ -274,8 +275,9 @@ class AnalysisWindow(QMainWindow):
         self.analyze_button.setEnabled(len(self.selected_laps) > 0)
 
         # Update the map to show selected laps
-        if hasattr(self, "map_widget") and self.fit_file.has_gps:
+        if self.fit_file.has_gps:
             self.map_widget.set_selected_laps(self.selected_laps)
+            self.map_widget.update()
 
     def toggle_lap_selection(self):
         """Select or deselect all laps"""
@@ -482,5 +484,6 @@ class AnalysisWindow(QMainWindow):
         self.settings.save_file_settings(self.fit_file.filename, self.file_settings)
 
         # Refresh the map if it exists
-        if hasattr(self, "map_widget") and self.fit_file.has_gps:
-            self.map_widget.create_map()
+        if self.fit_file.has_gps:
+            self.map_widget.set_wind(wind_speed, wind_direction)
+            self.map_widget.update()

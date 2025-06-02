@@ -6,23 +6,26 @@ from PySide6.QtWidgets import QVBoxLayout, QWidget
 
 
 class MapWidget(QWidget):
-    def __init__(self, fit_file, settings=None):
+    def __init__(self, fit_file, params):
         super().__init__()
         self.fit_file = fit_file
-        self.fit_file.settings = settings  # Store settings for use in create_map
         self.selected_laps = []
         self.layout = QVBoxLayout(self)
         self.webview = QWebEngineView()
         self.layout.addWidget(self.webview)
         self.layout.setContentsMargins(0, 0, 0, 0)
-        self.create_map()
+        self.wind_speed = params.get("wind_speed", None)
+        self.wind_direction = params.get("wind_direction", None)
 
     def set_selected_laps(self, selected_laps):
         """Update the selected laps and redraw the map"""
         self.selected_laps = selected_laps
-        self.create_map()
 
-    def create_map(self):
+    def set_wind(self, wind_speed, wind_direction):
+        self.wind_speed = wind_speed
+        self.wind_direction = wind_direction
+
+    def update(self):
         """Create and display a map from FIT file GPS data"""
         # Create a folium map
         records = self.fit_file.resampled_df
@@ -204,22 +207,7 @@ class MapWidget(QWidget):
         except Exception as e:
             print(f"Error fitting map bounds: {e}")
 
-        # Add wind arrow AFTER bounds are calculated and set
-        # Get settings directly to avoid circular import
-        from config.settings import Settings
-
-        if not hasattr(self.fit_file, "settings") or self.fit_file.settings is None:
-            settings = Settings()
-        else:
-            settings = self.fit_file.settings
-
-        file_settings = settings.get_file_settings(self.fit_file.filename)
-
-        # Add debug print
-        wind_speed = file_settings.get("wind_speed")
-        wind_dir = file_settings.get("wind_direction")
-
-        if wind_speed not in [None, 0] and wind_dir is not None:
+        if self.wind_speed not in [None, 0] and self.wind_direction:
             # Create a custom HTML element for the wind arrow
             wind_html = f"""
             <div id="wind-arrow" style="position: absolute; top: 10px; right: 10px; 
@@ -228,9 +216,9 @@ class MapWidget(QWidget):
                     box-shadow: 0 2px 5px rgba(0,0,0,0.2);">
                 <div style="font-weight: bold; text-align: center; margin-bottom: 5px; color: #4363d8;">Wind</div>
                 <div style="text-align: center;">
-                    <div style="font-size: 28px; transform: rotate({wind_dir + 180}deg); color: #4363d8;">↑</div>
-                    <div style="font-size: 12px; margin-top: 5px;">{wind_speed} m/s</div>
-                    <div style="font-size: 12px;">{wind_dir}°</div>
+                    <div style="font-size: 28px; transform: rotate({self.wind_direction + 180}deg); color: #4363d8;">↑</div>
+                    <div style="font-size: 12px; margin-top: 5px;">{self.wind_speed} m/s</div>
+                    <div style="font-size: 12px;">{self.wind_direction}°</div>
                 </div>
             </div>
             """
