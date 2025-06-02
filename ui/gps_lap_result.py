@@ -9,7 +9,6 @@ import numpy as np
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from PySide6.QtCore import Qt
-from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
     QCheckBox,
     QFormLayout,
@@ -32,6 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from models.virtual_elevation import VirtualElevation
+from ui.map_widget import (MapWidget, MapMode)
 
 
 class MplCanvas(FigureCanvas):
@@ -205,9 +205,12 @@ class GPSLapResult(QMainWindow):
         left_layout = QVBoxLayout(left_widget)
 
         # Map
-        if self.has_gps:
-            self.map_widget = QWebEngineView()
-            self.create_map()
+        self.map_widget = MapWidget(MapMode.MARKER, self.merged_data, self.params)
+        if self.map_widget.has_gps:
+            self.map_widget.set_marker_pos(self.gps_marker_pos)
+            self.map_widget.set_trim_start(self.trim_start)
+            self.map_widget.set_trim_end(self.trim_end)
+            self.map_widget.update()
             left_layout.addWidget(self.map_widget, 2)
         else:
             no_gps_label = QLabel("No GPS data available")
@@ -366,203 +369,6 @@ class GPSLapResult(QMainWindow):
 
         main_widget.setLayout(main_layout)
         self.setCentralWidget(main_widget)
-
-    def create_map(self):
-        """Create the map showing the merged track with start/end markers, GPS marker, and trimmed portion"""
-        if not self.has_gps or not self.route_points:
-            return
-
-        # Calculate center point
-        center_lat = (self.start_lat + self.end_lat) / 2
-        center_lon = (self.start_lon + self.end_lon) / 2
-
-        # Create map
-        m = folium.Map(location=[center_lat, center_lon], zoom_start=12)
-
-        try:
-            # Map time indices to route indices
-            if not hasattr(self, "route_timestamps") or not self.route_timestamps:
-                # Fall back to simple index mapping if no timestamps available
-                total_points = len(self.route_points)
-                total_records = len(self.merged_data)
-
-                if total_points > 0 and total_records > 0:
-                    route_trim_start = min(
-                        int(self.trim_start * total_points / total_records),
-                        total_points - 1,
-                    )
-                    route_trim_end = min(
-                        int(self.trim_end * total_points / total_records),
-                        total_points - 1,
-                    )
-                    route_marker_pos = min(
-                        int(self.gps_marker_pos * total_points / total_records),
-                        total_points - 1,
-                    )
-                else:
-                    route_trim_start = 0
-                    route_trim_end = len(self.route_points) - 1
-                    route_marker_pos = int((route_trim_start + route_trim_end) / 2)
-            else:
-                # Map using timestamps
-                route_trim_start = self.map_time_to_route_index(self.trim_start)
-                route_trim_end = self.map_time_to_route_index(self.trim_end)
-                route_marker_pos = self.map_time_to_route_index(self.gps_marker_pos)
-
-                # Fall back if mapping fails
-                if (
-                    route_trim_start is None
-                    or route_trim_end is None
-                    or route_marker_pos is None
-                ):
-                    total_points = len(self.route_points)
-                    total_records = len(self.merged_data)
-
-                    if total_points > 0 and total_records > 0:
-                        route_trim_start = min(
-                            int(self.trim_start * total_points / total_records),
-                            total_points - 1,
-                        )
-                        route_trim_end = min(
-                            int(self.trim_end * total_points / total_records),
-                            total_points - 1,
-                        )
-                        route_marker_pos = min(
-                            int(self.gps_marker_pos * total_points / total_records),
-                            total_points - 1,
-                        )
-                    else:
-                        route_trim_start = 0
-                        route_trim_end = len(self.route_points) - 1
-                        route_marker_pos = int((route_trim_start + route_trim_end) / 2)
-
-            # Make sure indices are valid
-            route_trim_start = max(0, min(route_trim_start, len(self.route_points) - 1))
-            route_trim_end = max(
-                route_trim_start, min(route_trim_end, len(self.route_points) - 1)
-            )
-            route_marker_pos = max(
-                route_trim_start, min(route_marker_pos, route_trim_end)
-            )
-
-            # 1. Draw the parts before trim_start with dashed blue line (if exists)
-            if route_trim_start > 0:
-                pre_trim_route = self.route_points[: route_trim_start + 1]
-                folium.PolyLine(
-                    pre_trim_route,
-                    color="#4363d8",  # Blue color
-                    weight=3,
-                    opacity=0.5,
-                    dash_array="5,10",  # Dashed line
-                    popup="Pre-selected portion",
-                ).add_to(m)
-
-            # 2. Draw the parts after trim_end with dashed blue line (if exists)
-            if route_trim_end < len(self.route_points) - 1:
-                post_trim_route = self.route_points[route_trim_end:]
-                folium.PolyLine(
-                    post_trim_route,
-                    color="#4363d8",  # Blue color
-                    weight=3,
-                    opacity=0.5,
-                    dash_array="5,10",  # Dashed line
-                    popup="Post-selected portion",
-                ).add_to(m)
-
-            # 3. Draw the selected portion with solid blue line
-            trimmed_route = self.route_points[route_trim_start : route_trim_end + 1]
-            if len(trimmed_route) > 1:
-                folium.PolyLine(
-                    trimmed_route,
-                    color="#4363d8",  # Blue color
-                    weight=5,  # Slightly thicker
-                    opacity=1.0,  # Full opacity
-                    popup="Selected portion",
-                ).add_to(m)
-
-                # Add trim markers
-                folium.Marker(
-                    location=trimmed_route[0],
-                    popup="Trim Start",
-                    icon=folium.Icon(color="green", icon="play", prefix="fa"),
-                ).add_to(m)
-
-                folium.Marker(
-                    location=trimmed_route[-1],
-                    popup="Trim End",
-                    icon=folium.Icon(color="red", icon="stop", prefix="fa"),
-                ).add_to(m)
-
-                # Add GPS marker
-                if 0 <= route_marker_pos - route_trim_start < len(trimmed_route):
-                    marker_location = trimmed_route[route_marker_pos - route_trim_start]
-                    folium.Marker(
-                        location=marker_location,
-                        popup="GPS Lap Marker",
-                        icon=folium.Icon(color="orange", icon="flag", prefix="fa"),
-                    ).add_to(m)
-
-                    # Add a circle around the GPS marker to show the detection radius
-                    folium.Circle(
-                        location=marker_location,
-                        radius=20,  # 20 meters radius for detection
-                        color="#FFA500",
-                        fill=True,
-                        fill_color="#FFA500",
-                        fill_opacity=0.2,
-                        popup="GPS Marker Detection Zone",
-                    ).add_to(m)
-
-        except Exception as e:
-            print(f"Error highlighting route: {e}")
-
-        # Calculate bounds for automatic zoom
-        try:
-            if self.route_points:
-                lats = [p[0] for p in self.route_points]
-                lons = [p[1] for p in self.route_points]
-                min_lat, max_lat = min(lats), max(lats)
-                min_lon, max_lon = min(lons), max(lons)
-
-                # Add some padding (5%)
-                lat_padding = (max_lat - min_lat) * 0.05
-                lon_padding = (max_lon - min_lon) * 0.05
-                bounds = [
-                    [min_lat - lat_padding, min_lon - lon_padding],
-                    [max_lat + lat_padding, max_lon + lon_padding],
-                ]
-                m.fit_bounds(bounds)
-        except Exception as e:
-            print(f"Error fitting map bounds: {e}")
-
-        # Add wind arrow AFTER map bounds have been set
-        wind_speed = self.params.get("wind_speed")
-        wind_dir = self.params.get("wind_direction")
-
-        if wind_speed not in [None, 0] and wind_dir is not None:
-            # Create a custom HTML element for the wind arrow
-            wind_html = f"""
-            <div id="wind-arrow" style="position: absolute; top: 10px; right: 10px; 
-                    background-color: rgba(255, 255, 255, 0.9); padding: 10px; 
-                    border-radius: 5px; border: 1px solid #4363d8; z-index: 1000;
-                    box-shadow: 0 2px 5px rgba(0,0,0,0.2);">
-                <div style="font-weight: bold; text-align: center; margin-bottom: 5px; color: #4363d8;">Wind</div>
-                <div style="text-align: center;">
-                    <div style="font-size: 28px; transform: rotate({wind_dir + 180}deg); color: #4363d8;">↑</div>
-                    <div style="font-size: 12px; margin-top: 5px;">{wind_speed} m/s</div>
-                    <div style="font-size: 12px;">{wind_dir}°</div>
-                </div>
-            </div>
-            """
-
-            # Add the HTML element to the map
-            m.get_root().html.add_child(folium.Element(wind_html))
-
-        # Save map to HTML and load into QWebEngineView
-        data = io.BytesIO()
-        m.save(data, close_file=False)
-        html_content = data.getvalue().decode()
-        self.map_widget.setHtml(html_content)
 
     def update_config_text(self):
         """Update the configuration text display"""
@@ -1200,6 +1006,7 @@ class GPSLapResult(QMainWindow):
             self.gps_marker_slider.setValue(value)
             self.gps_marker_pos = value
             self.gps_marker_label.setText(f"{value} s")
+            self.map_widget.set_marker_pos(value)
 
         # Detect laps based on new trim values
         self.detect_laps()
@@ -1209,7 +1016,8 @@ class GPSLapResult(QMainWindow):
         self.update_plots()
 
         # Update map to show trim points
-        self.create_map()
+        self.map_widget.set_trim_start(self.trim_start)
+        self.map_widget.update()
 
     def on_trim_end_changed(self, value):
         """Handle trim end slider value change"""
@@ -1229,6 +1037,7 @@ class GPSLapResult(QMainWindow):
             self.gps_marker_slider.setValue(value)
             self.gps_marker_pos = value
             self.gps_marker_label.setText(f"{value} s")
+            self.map_widget.set_marker_pos(value)
 
         # Detect laps based on new trim values
         self.detect_laps()
@@ -1237,8 +1046,8 @@ class GPSLapResult(QMainWindow):
         self.calculate_ve()
         self.update_plots()
 
-        # Update map to show trim points
-        self.create_map()
+        self.map_widget.set_trim_end(self.trim_end)
+        self.map_widget.update()
 
     def on_gps_marker_changed(self, value):
         """Handle GPS marker slider value change"""
@@ -1253,7 +1062,8 @@ class GPSLapResult(QMainWindow):
         self.update_plots()
 
         # Update map to show GPS marker
-        self.create_map()
+        self.map_widget.set_marker_pos(value)
+        self.map_widget.update()
 
     def on_cda_changed(self, value):
         """Handle CdA slider value change"""
@@ -1403,38 +1213,3 @@ class GPSLapResult(QMainWindow):
         self.analysis_window = AnalysisWindow(self.fit_file, self.settings)
         self.analysis_window.show()
         self.close()
-
-    def map_time_to_route_index(self, time_index):
-        """
-        Map a time index from the full dataset to the corresponding index in route_points
-
-        Parameters:
-        -----------
-        time_index : int
-            Index in the merged_data dataframe
-
-        Returns:
-        --------
-        int
-            Corresponding index in the route_points list, or None if not mappable
-        """
-        if not hasattr(self, "route_timestamps") or not self.route_timestamps:
-            return None
-
-        if time_index < 0 or time_index >= len(self.merged_data):
-            return None
-
-        # Get the timestamp at this index
-        target_timestamp = self.merged_data["timestamp"].iloc[time_index]
-
-        # Find the closest timestamp in route_timestamps
-        if target_timestamp in self.route_timestamps:
-            return self.route_timestamps.index(target_timestamp)
-
-        # If not found directly, find the closest one
-        for i, ts in enumerate(self.route_timestamps):
-            if ts >= target_timestamp:
-                return i
-
-        # If we get here, target_timestamp is after all route_timestamps
-        return len(self.route_timestamps) - 1
