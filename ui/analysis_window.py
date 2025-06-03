@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ui.map_widget import MapWidget
+from ui.map_widget import (MapWidget, MapMode)
 
 
 class AnalysisWindow(QMainWindow):
@@ -51,7 +51,7 @@ class AnalysisWindow(QMainWindow):
         left_layout = QVBoxLayout()
 
         # Add map widget if GPS data is available
-        self.map_widget = MapWidget(self.fit_file.resampled_df,
+        self.map_widget = MapWidget(MapMode.LAPS, self.fit_file.resampled_df,
                                     self.file_settings)
         if self.map_widget.has_gps:
             self.map_widget.update()

@@ -3,10 +3,13 @@ import io
 import folium
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QVBoxLayout, QWidget
+from enum import Enum, auto
 
+class MapMode(Enum):
+    LAPS = auto()
 
 class MapWidget(QWidget):
-    def __init__(self, records, params):
+    def __init__(self, mode: MapMode, records, params):
         super().__init__()
         self.records = records
         if ("position_lat" in records and "position_long" in records):
@@ -32,6 +35,7 @@ class MapWidget(QWidget):
         self.layout.setContentsMargins(0, 0, 0, 0)
         self.wind_speed = params.get("wind_speed", None)
         self.wind_direction = params.get("wind_direction", None)
+        self.mode = mode
 
     def set_selected_laps(self, lap_data, selected_laps):
         """Update the selected laps and redraw the map"""
@@ -175,10 +179,11 @@ class MapWidget(QWidget):
         m = folium.Map(location=[self.center_lat, self.center_lon], zoom_start=12)
 
         # If no laps are selected, draw the full track as solid blue
-        if self.selected_laps:
-            points_to_zoom = self.draw_selected_laps(m)
-        else:
-            points_to_zoom = self.draw_default(m)
+        if self.mode == MapMode.LAPS:
+            if self.selected_laps:
+                points_to_zoom = self.draw_selected_laps(m)
+            else:
+                points_to_zoom = self.draw_default(m)
 
         # Calculate bounds for automatic zoom
         try:
