@@ -35,7 +35,7 @@ from PySide6.QtWidgets import (
 from models.virtual_elevation import VirtualElevation
 from ui.map_widget import (MapWidget, MapMode)
 from ui.async_worker import AsyncWorker
-from ui.ve_plot import VEPlotLabel, VEFigure
+from ui.ve_plot import VEPlotLabel, VEFigure, VEPlotSaver
 
 
 class VEWorker(AsyncWorker):
@@ -768,6 +768,8 @@ class GPSGateResult(QMainWindow):
         self.ve_thread = QThread()
         self.ve_worker.moveToThread(self.ve_thread)
         self.ve_worker.resultReady.connect(self.on_ve_result_ready)
+        self.ve_plot_saver = VEPlotSaver(VEWorker(self.merged_data, self.params),
+                                         self.ve_thread)
         self.ve_thread.start()
         QApplication.instance().aboutToQuit.connect(self.join_threads)
 
@@ -1680,7 +1682,7 @@ class GPSGateResult(QMainWindow):
         plot_filename = f"{file_basename}_gps_gate_laps_{lap_str}_{config_name}.png"
         plot_path = os.path.join(plot_dir, plot_filename)
 
-        self.ve_plot.save(plot_path)
+        self.ve_plot_saver.save(self.ve_worker.get_values(), plot_path)
 
         # Save trim and gate positions to file settings
         file_settings = self.settings.get_file_settings(self.fit_file.filename)

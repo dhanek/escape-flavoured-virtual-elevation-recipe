@@ -19,9 +19,6 @@ class VEPlotLabel(QLabel):
         self.setMinimumSize(self.size())
         self.screen.logicalDotsPerInchChanged.connect(self.on_dpi_changed)
 
-    def save(self, plot_path):
-        self.pixmap().save(plot_path, "PNG")
-
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.sizeChanged.emit()
@@ -73,3 +70,25 @@ class VEFigure:
         return {"buf": fig_buf,
                 "width": width,
                 "height": height}
+
+class VEPlotSaver:
+    def __init__(self, worker, thread):
+        self.worker = worker
+        worker.moveToThread(thread)
+        worker.resultReady.connect(self.on_ve_result_ready)
+
+    def save(self, values, plot_path, width=3840, height=2160, dpi=200):
+        self.plot_path = plot_path
+
+        values["plot_size_info"] = {"logical_dpi": dpi,
+                                    "width": width,
+                                    "height": height,
+                                    "pixel_ratio": 1.0}
+        self.worker.set_values(values)
+
+    def on_ve_result_ready(self, res):
+        fig_res = res["fig_res"]
+        image = QImage(fig_res["buf"].data, fig_res["width"], fig_res["height"],
+                       QImage.Format_RGBA8888)
+        pixmap = QPixmap.fromImage(image)
+        pixmap.save(self.plot_path, "PNG")
