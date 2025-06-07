@@ -22,6 +22,9 @@ class AsyncWorker(QObject):
             self._working = True
         self.trigger.emit()
 
+    def get_values(self):
+        return copy.deepcopy(self._latest_values)
+
     @Slot()
     def process(self):
         self._mutex.lock()
