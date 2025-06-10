@@ -8,12 +8,8 @@ from pathlib import Path
 
 import folium
 import numpy as np
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
-from PySide6.QtCore import (
-    Qt,
-    QThread,
-)
+
+from PySide6.QtCore import Qt, QThread
 from PySide6.QtWidgets import (
     QApplication,
     QFormLayout,
@@ -24,7 +20,6 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QSizePolicy,
     QSlider,
     QSplitter,
     QTextEdit,
@@ -35,13 +30,16 @@ from PySide6.QtWidgets import (
 from models.virtual_elevation import VirtualElevation
 from ui.map_widget import (MapWidget, MapMode)
 from ui.async_worker import AsyncWorker
+from ui.ve_plot import VEPlotLabel, VEFigure, VEPlotSaver
+
 
 class VEWorker(AsyncWorker):
     INPUT_KEYS = [
         "trim_start",
         "trim_end",
         "current_cda",
-        "current_crr"
+        "current_crr",
+        "plot_size_info",
     ]
 
     RESULT_KEYS = [
@@ -53,6 +51,7 @@ class VEWorker(AsyncWorker):
         "ve_elevation_diff",
         "virtual_elevation_calibrated",
         "virtual_elevation",
+        "fig_res",
     ]
 
     def __init__(self, merged_data, params):
@@ -60,15 +59,23 @@ class VEWorker(AsyncWorker):
         self.merged_data = merged_data
         # Create VE calculator
         self.ve_calculator = VirtualElevation(self.merged_data, params)
+        self.ve_valid = False
 
     def _process_value(self, values: dict):
         for key in VEWorker.INPUT_KEYS:
             setattr(self, key, values[key])
 
-        self.calculate_ve()
-        self.prepare_plots()
+        if values["update_ve"] or not self.ve_valid:
+            self.calculate_ve()
+            self.prepare_plots()
+            self.ve_valid = True
 
         out_values = {}
+        if not self.ve_valid:
+            return out_values
+
+        self.update_plots()
+
         for key in VEWorker.RESULT_KEYS:
             out_values[key] = getattr(self, key)
 
@@ -166,301 +173,10 @@ class VEWorker(AsyncWorker):
             # Final fallback to time-based if no distance or speed data
             self.distance = np.arange(len(self.virtual_elevation)) / 1000
 
-class MplCanvas(FigureCanvas):
-    """Matplotlib canvas for embedding in Qt"""
-
-    def __init__(self, parent=None, width=5, height=4, dpi=100):
-        self.fig = Figure(figsize=(width, height), dpi=dpi)
-        self.axes = self.fig.add_subplot(111)
-        super().__init__(self.fig)
-        self.setParent(parent)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.updateGeometry()
-
-
-class AnalysisResult(QMainWindow):
-    """Window for displaying virtual elevation analysis results"""
-
-    def __init__(self, parent, fit_file, settings, selected_laps, params):
-        super().__init__()
-        self.parent = parent
-        self.fit_file = fit_file
-        self.settings = settings
-        self.selected_laps = selected_laps
-        self.params = params
-        self.result_dir = settings.result_dir
-
-        # Prepare merged lap data
-        self.prepare_merged_data()
-
-        self.ve_worker = VEWorker(self.merged_data, self.params)
-        self.ve_thread = QThread()
-        self.ve_worker.moveToThread(self.ve_thread)
-        self.ve_worker.resultReady.connect(self.on_ve_result_ready)
-        self.ve_thread.start()
-        QApplication.instance().aboutToQuit.connect(self.join_threads)
-
-        # Get lap combination ID for settings
-        self.lap_combo_id = "_".join(map(str, sorted(self.selected_laps)))
-
-        # Try to load saved trim values for this lap combination
-        file_settings = self.settings.get_file_settings(self.fit_file.filename)
-        trim_settings = file_settings.get("trim_settings", {})
-        saved_trim = trim_settings.get(self.lap_combo_id, {})
-
-        # Initialize UI values
-        if saved_trim and "trim_start" in saved_trim and "trim_end" in saved_trim:
-            # Use saved trim values if available
-            self.trim_start = saved_trim["trim_start"]
-            self.trim_end = saved_trim["trim_end"]
-        else:
-            # Use defaults
-            self.trim_start = 0
-            self.trim_end = len(self.merged_data)
-
-        self.current_cda = self.params.get("cda")
-        self.current_crr = self.params.get("crr")
-
-        # If CdA or Crr are None (to be optimized), set initial values to middle of range
-        if self.current_cda is None:
-            if saved_trim and "cda" in saved_trim:
-                self.current_cda = saved_trim["cda"]
-            else:
-                self.current_cda = (
-                    self.params.get("cda_min", 0.15) + self.params.get("cda_max", 0.5)
-                ) / 2
-
-        if self.current_crr is None:
-            if saved_trim and "crr" in saved_trim:
-                self.current_crr = saved_trim["crr"]
-            else:
-                self.current_crr = (
-                    self.params.get("crr_min", 0.001) + self.params.get("crr_max", 0.03)
-                ) / 2
-
-        # Setup UI
-        self.initUI()
-
-        self.async_update()
-
-    def prepare_merged_data(self):
-        """Extract and merge data for selected laps"""
-        # Get records for selected laps
-        self.merged_data = self.fit_file.get_records_for_laps(self.selected_laps)
-
-        # Check if we have enough data
-        if len(self.merged_data) < 30:
-            raise ValueError("Not enough data points (less than 30 seconds)")
-
-        # Get lap info for display
-        self.lap_info = []
-        all_laps = self.fit_file.get_lap_data()
-
-        for lap in all_laps:
-            if lap["lap_number"] in self.selected_laps:
-                self.lap_info.append(lap)
-
-        # Calculate distance, duration, etc. for the merged lap
-        self.total_distance = sum(lap["distance"] for lap in self.lap_info)
-        self.total_duration = sum(lap["duration"] for lap in self.lap_info)
-        self.avg_power = np.mean(self.merged_data["power"].dropna())
-        self.avg_speed = (
-            self.total_distance / self.total_duration
-        ) * 3600  # Convert to km/h
-
-    def initUI(self):
-        """Initialize the UI components"""
-        self.setWindowTitle(
-            f'Virtual Elevation Analysis - Laps {", ".join(map(str, self.selected_laps))}'
-        )
-        self.setGeometry(50, 50, 1200, 800)
-
-        # Main widget and layout
-        main_widget = QWidget()
-        main_layout = QVBoxLayout()
-
-        # Create a splitter for adjustable panels
-        splitter = QSplitter(Qt.Horizontal)
-
-        # Left side - Map and controls
-        left_widget = QWidget()
-        left_layout = QVBoxLayout(left_widget)
-
-        # Map
-        self.map_widget = MapWidget(MapMode.TRIM, self.merged_data, self.params)
-        if self.map_widget.has_gps():
-            self.map_widget.set_trim_start(self.trim_start)
-            self.map_widget.set_trim_end(self.trim_end)
-            self.map_widget.update()
-            left_layout.addWidget(self.map_widget, 2)
-        else:
-            no_gps_label = QLabel("No GPS data available")
-            no_gps_label.setAlignment(Qt.AlignCenter)
-            left_layout.addWidget(no_gps_label, 2)
-
-        # Parameter display
-        param_group = QGroupBox("Analysis Parameters")
-        param_layout = QFormLayout()
-
-        self.config_text = QTextEdit()
-        self.config_text.setReadOnly(True)
-        self.update_config_text()
-        param_layout.addRow("Configuration:", self.config_text)
-
-        # Configuration name input
-        self.config_name = QLineEdit("Test")
-        param_layout.addRow("Save as:", self.config_name)
-
-        param_group.setLayout(param_layout)
-        left_layout.addWidget(param_group, 1)
-
-        # Control buttons
-        button_layout = QHBoxLayout()
-
-        self.back_button = QPushButton("Back to Lap Selection")
-        self.back_button.clicked.connect(self.back_to_selection)
-
-        self.close_button = QPushButton("Close App")
-        self.close_button.clicked.connect(self.close)
-
-        self.save_button = QPushButton("Save Results")
-        self.save_button.clicked.connect(self.save_results)
-        self.save_button.setStyleSheet(f"background-color: #4363d8; color: white;")
-
-        button_layout.addWidget(self.back_button)
-        button_layout.addWidget(self.close_button)
-        button_layout.addWidget(self.save_button)
-
-        left_layout.addLayout(button_layout)
-
-        # Right side - Plots and sliders
-        right_widget = QWidget()
-        right_layout = QVBoxLayout(right_widget)
-
-        # Plot area
-        plot_widget = QWidget()
-        plot_layout = QVBoxLayout(plot_widget)
-
-        # Create plots
-        self.fig_canvas = MplCanvas(self, width=5, height=4, dpi=100)
-        plot_layout.addWidget(self.fig_canvas)
-
-        right_layout.addWidget(plot_widget, 3)
-
-        # Sliders
-        slider_group = QGroupBox("Adjust Parameters")
-        slider_layout = QFormLayout()
-
-        # Trim start slider
-        self.trim_start_slider = QSlider(Qt.Horizontal)
-        self.trim_start_slider.setMinimum(0)
-        self.trim_start_slider.setMaximum(len(self.merged_data) - 30)
-        self.trim_start_slider.setValue(self.trim_start)  # Use the loaded trim value
-        self.trim_start_slider.valueChanged.connect(self.on_trim_start_changed)
-
-        self.trim_start_label = QLabel(f"{self.trim_start} s")
-        trim_start_layout = QHBoxLayout()
-        trim_start_layout.addWidget(self.trim_start_slider)
-        trim_start_layout.addWidget(self.trim_start_label)
-
-        slider_layout.addRow("Trim Start:", trim_start_layout)
-
-        # Trim end slider
-        self.trim_end_slider = QSlider(Qt.Horizontal)
-        self.trim_end_slider.setMinimum(30)
-        self.trim_end_slider.setMaximum(len(self.merged_data))
-        self.trim_end_slider.setValue(self.trim_end)  # Use the loaded trim value
-        self.trim_end_slider.valueChanged.connect(self.on_trim_end_changed)
-
-        self.trim_end_label = QLabel(f"{self.trim_end} s")
-        trim_end_layout = QHBoxLayout()
-        trim_end_layout.addWidget(self.trim_end_slider)
-        trim_end_layout.addWidget(self.trim_end_label)
-
-        slider_layout.addRow("Trim End:", trim_end_layout)
-
-        # CdA slider
-        self.cda_slider = QSlider(Qt.Horizontal)
-        self.cda_slider.setMinimum(int(self.params.get("cda_min", 0.15) * 1000))
-        self.cda_slider.setMaximum(int(self.params.get("cda_max", 0.5) * 1000))
-        self.cda_slider.setValue(int(self.current_cda * 1000))
-        self.cda_slider.valueChanged.connect(self.on_cda_changed)
-        self.cda_slider.setEnabled(self.params.get("cda") is None)
-
-        self.cda_label = QLabel(f"{self.current_cda:.3f}")
-        cda_layout = QHBoxLayout()
-        cda_layout.addWidget(self.cda_slider)
-        cda_layout.addWidget(self.cda_label)
-
-        slider_layout.addRow("CdA:", cda_layout)
-
-        # Crr slider
-        self.crr_slider = QSlider(Qt.Horizontal)
-        self.crr_slider.setMinimum(int(self.params.get("crr_min", 0.001) * 10000))
-        self.crr_slider.setMaximum(int(self.params.get("crr_max", 0.03) * 10000))
-        self.crr_slider.setValue(int(self.current_crr * 10000))
-        self.crr_slider.valueChanged.connect(self.on_crr_changed)
-        self.crr_slider.setEnabled(self.params.get("crr") is None)
-
-        self.crr_label = QLabel(f"{self.current_crr:.4f}")
-        crr_layout = QHBoxLayout()
-        crr_layout.addWidget(self.crr_slider)
-        crr_layout.addWidget(self.crr_label)
-
-        slider_layout.addRow("Crr:", crr_layout)
-
-        slider_group.setLayout(slider_layout)
-        right_layout.addWidget(slider_group, 1)
-
-        # Add widgets to splitter
-        splitter.addWidget(left_widget)
-        splitter.addWidget(right_widget)
-        splitter.setSizes([400, 800])  # Set initial sizes
-
-        # Add splitter to main layout
-        main_layout.addWidget(splitter)
-
-        main_widget.setLayout(main_layout)
-        self.setCentralWidget(main_widget)
-
-    def update_config_text(self):
-        """Update the configuration text display"""
-        lap_str = ", ".join(map(str, self.selected_laps))
-        distance_str = f"{self.total_distance:.2f} km"
-        duration_str = f"{self.total_duration:.0f} s"
-        power_str = f"{self.avg_power:.0f} W"
-        speed_str = f"{self.avg_speed:.2f} km/h"
-
-        config_text = f"Selected Laps: {lap_str}\n"
-        config_text += f"Distance: {distance_str}\n"
-        config_text += f"Duration: {duration_str}\n"
-        config_text += f"Avg Power: {power_str}\n"
-        config_text += f"Avg Speed: {speed_str}\n"
-        config_text += f"System Mass: {self.params.get('system_mass', 90)} kg\n"
-        config_text += f"Rho (air density): {self.params.get('rho', 1.2)} kg/m³\n"
-        config_text += f"Eta (drivetrain eff.): {self.params.get('eta', 0.98)}\n"
-        config_text += f"Current CdA: {self.current_cda:.3f}\n"
-        config_text += f"Current Crr: {self.current_crr:.4f}\n"
-
-        if self.params.get("wind_speed") not in [None, 0]:
-            config_text += f"Wind Speed: {self.params.get('wind_speed')} m/s\n"
-
-        if self.params.get("wind_direction") is not None:
-            config_text += f"Wind Direction: {self.params.get('wind_direction')}°"
-
-        self.config_text.setText(config_text)
-
     def update_plots(self):
         """Update the virtual elevation plots"""
-        # Clear previous plots
-        self.fig_canvas.axes.clear()
-
-        # Create figure with two subplots
-        self.fig_canvas.fig.clear()
-
-        gs = self.fig_canvas.fig.add_gridspec(2, 1, height_ratios=[3, 1])
-        ax1 = self.fig_canvas.fig.add_subplot(gs[0])
-        ax2 = self.fig_canvas.fig.add_subplot(gs[1])
+        ve_fig = VEFigure(self.plot_size_info)
+        fig, ax1, ax2 = ve_fig.get_fig_axes()
 
         distance = self.distance
 
@@ -589,13 +305,13 @@ class AnalysisResult(QMainWindow):
         # Add text with CdA and Crr values - positioned completely outside plot area
         cda_str = f"CdA: {self.current_cda:.3f}"
         crr_str = f"Crr: {self.current_crr:.4f}"
-        self.fig_canvas.fig.text(
+        fig.text(
             0.01,
             0.99,
             cda_str + "\n" + crr_str,
             verticalalignment="top",
             horizontalalignment="left",
-            transform=self.fig_canvas.fig.transFigure,
+            transform=fig.transFigure,
             bbox=dict(boxstyle="round", facecolor="white", alpha=0.9),
         )
 
@@ -616,18 +332,294 @@ class AnalysisResult(QMainWindow):
             else:
                 metrics_text = f"{r2_str}\n{rmse_str}"
 
-            self.fig_canvas.fig.text(
+            fig.text(
                 0.99,
                 0.99,
                 metrics_text,
                 verticalalignment="top",
                 horizontalalignment="right",
-                transform=self.fig_canvas.fig.transFigure,
+                transform=fig.transFigure,
                 bbox=dict(boxstyle="round", facecolor="white", alpha=0.9),
             )
 
-        self.fig_canvas.fig.tight_layout()
-        self.fig_canvas.draw_idle()
+        self.fig_res = ve_fig.draw()
+
+
+class AnalysisResult(QMainWindow):
+    """Window for displaying virtual elevation analysis results"""
+
+    def __init__(self, parent, fit_file, settings, selected_laps, params):
+        super().__init__()
+        self.parent = parent
+        self.fit_file = fit_file
+        self.settings = settings
+        self.selected_laps = selected_laps
+        self.params = params
+        self.result_dir = settings.result_dir
+
+        # Prepare merged lap data
+        self.prepare_merged_data()
+
+        self.ve_worker = VEWorker(self.merged_data, self.params)
+        self.ve_thread = QThread()
+        self.ve_worker.moveToThread(self.ve_thread)
+        self.ve_worker.resultReady.connect(self.on_ve_result_ready)
+        self.ve_plot_saver = VEPlotSaver(VEWorker(self.merged_data, self.params),
+                                         self.ve_thread)
+        self.ve_thread.start()
+        QApplication.instance().aboutToQuit.connect(self.join_threads)
+
+        # Get lap combination ID for settings
+        self.lap_combo_id = "_".join(map(str, sorted(self.selected_laps)))
+
+        # Try to load saved trim values for this lap combination
+        file_settings = self.settings.get_file_settings(self.fit_file.filename)
+        trim_settings = file_settings.get("trim_settings", {})
+        saved_trim = trim_settings.get(self.lap_combo_id, {})
+
+        # Initialize UI values
+        if saved_trim and "trim_start" in saved_trim and "trim_end" in saved_trim:
+            # Use saved trim values if available
+            self.trim_start = saved_trim["trim_start"]
+            self.trim_end = saved_trim["trim_end"]
+        else:
+            # Use defaults
+            self.trim_start = 0
+            self.trim_end = len(self.merged_data)
+
+        self.current_cda = self.params.get("cda")
+        self.current_crr = self.params.get("crr")
+
+        # If CdA or Crr are None (to be optimized), set initial values to middle of range
+        if self.current_cda is None:
+            if saved_trim and "cda" in saved_trim:
+                self.current_cda = saved_trim["cda"]
+            else:
+                self.current_cda = (
+                    self.params.get("cda_min", 0.15) + self.params.get("cda_max", 0.5)
+                ) / 2
+
+        if self.current_crr is None:
+            if saved_trim and "crr" in saved_trim:
+                self.current_crr = saved_trim["crr"]
+            else:
+                self.current_crr = (
+                    self.params.get("crr_min", 0.001) + self.params.get("crr_max", 0.03)
+                ) / 2
+
+        # Setup UI
+        self.initUI()
+
+        self.async_update()
+        self.ve_plot.sizeChanged.connect(self.on_plot_size_changed)
+
+    def prepare_merged_data(self):
+        """Extract and merge data for selected laps"""
+        # Get records for selected laps
+        self.merged_data = self.fit_file.get_records_for_laps(self.selected_laps)
+
+        # Check if we have enough data
+        if len(self.merged_data) < 30:
+            raise ValueError("Not enough data points (less than 30 seconds)")
+
+        # Get lap info for display
+        self.lap_info = []
+        all_laps = self.fit_file.get_lap_data()
+
+        for lap in all_laps:
+            if lap["lap_number"] in self.selected_laps:
+                self.lap_info.append(lap)
+
+        # Calculate distance, duration, etc. for the merged lap
+        self.total_distance = sum(lap["distance"] for lap in self.lap_info)
+        self.total_duration = sum(lap["duration"] for lap in self.lap_info)
+        self.avg_power = np.mean(self.merged_data["power"].dropna())
+        self.avg_speed = (
+            self.total_distance / self.total_duration
+        ) * 3600  # Convert to km/h
+
+    def initUI(self):
+        """Initialize the UI components"""
+        self.setWindowTitle(
+            f'Virtual Elevation Analysis - Laps {", ".join(map(str, self.selected_laps))}'
+        )
+        self.setGeometry(50, 50, 1200, 800)
+
+        # Main widget and layout
+        main_widget = QWidget()
+        main_layout = QVBoxLayout()
+
+        # Create a splitter for adjustable panels
+        splitter = QSplitter(Qt.Horizontal)
+
+        # Left side - Map and controls
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+
+        # Map
+        self.map_widget = MapWidget(MapMode.TRIM, self.merged_data, self.params)
+        if self.map_widget.has_gps():
+            self.map_widget.set_trim_start(self.trim_start)
+            self.map_widget.set_trim_end(self.trim_end)
+            self.map_widget.update()
+            left_layout.addWidget(self.map_widget, 2)
+        else:
+            no_gps_label = QLabel("No GPS data available")
+            no_gps_label.setAlignment(Qt.AlignCenter)
+            left_layout.addWidget(no_gps_label, 2)
+
+        # Parameter display
+        param_group = QGroupBox("Analysis Parameters")
+        param_layout = QFormLayout()
+
+        self.config_text = QTextEdit()
+        self.config_text.setReadOnly(True)
+        self.update_config_text()
+        param_layout.addRow("Configuration:", self.config_text)
+
+        # Configuration name input
+        self.config_name = QLineEdit("Test")
+        param_layout.addRow("Save as:", self.config_name)
+
+        param_group.setLayout(param_layout)
+        left_layout.addWidget(param_group, 1)
+
+        # Control buttons
+        button_layout = QHBoxLayout()
+
+        self.back_button = QPushButton("Back to Lap Selection")
+        self.back_button.clicked.connect(self.back_to_selection)
+
+        self.close_button = QPushButton("Close App")
+        self.close_button.clicked.connect(self.close)
+
+        self.save_button = QPushButton("Save Results")
+        self.save_button.clicked.connect(self.save_results)
+        self.save_button.setStyleSheet(f"background-color: #4363d8; color: white;")
+
+        button_layout.addWidget(self.back_button)
+        button_layout.addWidget(self.close_button)
+        button_layout.addWidget(self.save_button)
+
+        left_layout.addLayout(button_layout)
+
+        # Right side - Plots and sliders
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+
+        # Plot area
+        plot_widget = QWidget()
+        plot_layout = QVBoxLayout(plot_widget)
+
+        # Create plots
+        self.ve_plot = VEPlotLabel(self.screen())
+        plot_layout.addWidget(self.ve_plot)
+
+        right_layout.addWidget(plot_widget, 3)
+        self.plot_size_info = self.ve_plot.get_size_info()
+
+        # Sliders
+        slider_group = QGroupBox("Adjust Parameters")
+        slider_layout = QFormLayout()
+
+        # Trim start slider
+        self.trim_start_slider = QSlider(Qt.Horizontal)
+        self.trim_start_slider.setMinimum(0)
+        self.trim_start_slider.setMaximum(len(self.merged_data) - 30)
+        self.trim_start_slider.setValue(self.trim_start)  # Use the loaded trim value
+        self.trim_start_slider.valueChanged.connect(self.on_trim_start_changed)
+
+        self.trim_start_label = QLabel(f"{self.trim_start} s")
+        trim_start_layout = QHBoxLayout()
+        trim_start_layout.addWidget(self.trim_start_slider)
+        trim_start_layout.addWidget(self.trim_start_label)
+
+        slider_layout.addRow("Trim Start:", trim_start_layout)
+
+        # Trim end slider
+        self.trim_end_slider = QSlider(Qt.Horizontal)
+        self.trim_end_slider.setMinimum(30)
+        self.trim_end_slider.setMaximum(len(self.merged_data))
+        self.trim_end_slider.setValue(self.trim_end)  # Use the loaded trim value
+        self.trim_end_slider.valueChanged.connect(self.on_trim_end_changed)
+
+        self.trim_end_label = QLabel(f"{self.trim_end} s")
+        trim_end_layout = QHBoxLayout()
+        trim_end_layout.addWidget(self.trim_end_slider)
+        trim_end_layout.addWidget(self.trim_end_label)
+
+        slider_layout.addRow("Trim End:", trim_end_layout)
+
+        # CdA slider
+        self.cda_slider = QSlider(Qt.Horizontal)
+        self.cda_slider.setMinimum(int(self.params.get("cda_min", 0.15) * 1000))
+        self.cda_slider.setMaximum(int(self.params.get("cda_max", 0.5) * 1000))
+        self.cda_slider.setValue(int(self.current_cda * 1000))
+        self.cda_slider.valueChanged.connect(self.on_cda_changed)
+        self.cda_slider.setEnabled(self.params.get("cda") is None)
+
+        self.cda_label = QLabel(f"{self.current_cda:.3f}")
+        cda_layout = QHBoxLayout()
+        cda_layout.addWidget(self.cda_slider)
+        cda_layout.addWidget(self.cda_label)
+
+        slider_layout.addRow("CdA:", cda_layout)
+
+        # Crr slider
+        self.crr_slider = QSlider(Qt.Horizontal)
+        self.crr_slider.setMinimum(int(self.params.get("crr_min", 0.001) * 10000))
+        self.crr_slider.setMaximum(int(self.params.get("crr_max", 0.03) * 10000))
+        self.crr_slider.setValue(int(self.current_crr * 10000))
+        self.crr_slider.valueChanged.connect(self.on_crr_changed)
+        self.crr_slider.setEnabled(self.params.get("crr") is None)
+
+        self.crr_label = QLabel(f"{self.current_crr:.4f}")
+        crr_layout = QHBoxLayout()
+        crr_layout.addWidget(self.crr_slider)
+        crr_layout.addWidget(self.crr_label)
+
+        slider_layout.addRow("Crr:", crr_layout)
+
+        slider_group.setLayout(slider_layout)
+        right_layout.addWidget(slider_group, 1)
+
+        # Add widgets to splitter
+        splitter.addWidget(left_widget)
+        splitter.addWidget(right_widget)
+        splitter.setSizes([400, 800])  # Set initial sizes
+
+        # Add splitter to main layout
+        main_layout.addWidget(splitter)
+
+        main_widget.setLayout(main_layout)
+        self.setCentralWidget(main_widget)
+
+    def update_config_text(self):
+        """Update the configuration text display"""
+        lap_str = ", ".join(map(str, self.selected_laps))
+        distance_str = f"{self.total_distance:.2f} km"
+        duration_str = f"{self.total_duration:.0f} s"
+        power_str = f"{self.avg_power:.0f} W"
+        speed_str = f"{self.avg_speed:.2f} km/h"
+
+        config_text = f"Selected Laps: {lap_str}\n"
+        config_text += f"Distance: {distance_str}\n"
+        config_text += f"Duration: {duration_str}\n"
+        config_text += f"Avg Power: {power_str}\n"
+        config_text += f"Avg Speed: {speed_str}\n"
+        config_text += f"System Mass: {self.params.get('system_mass', 90)} kg\n"
+        config_text += f"Rho (air density): {self.params.get('rho', 1.2)} kg/m³\n"
+        config_text += f"Eta (drivetrain eff.): {self.params.get('eta', 0.98)}\n"
+        config_text += f"Current CdA: {self.current_cda:.3f}\n"
+        config_text += f"Current Crr: {self.current_crr:.4f}\n"
+
+        if self.params.get("wind_speed") not in [None, 0]:
+            config_text += f"Wind Speed: {self.params.get('wind_speed')} m/s\n"
+
+        if self.params.get("wind_direction") is not None:
+            config_text += f"Wind Direction: {self.params.get('wind_direction')}°"
+
+        self.config_text.setText(config_text)
 
     def on_trim_start_changed(self, value):
         """Handle trim start slider value change"""
@@ -786,7 +778,7 @@ class AnalysisResult(QMainWindow):
         plot_filename = f"{file_basename}_laps_{lap_str}_{config_name}.png"
         plot_path = os.path.join(plot_dir, plot_filename)
 
-        self.fig_canvas.fig.savefig(plot_path, dpi=300, bbox_inches="tight")
+        self.ve_plot_saver.save(self.ve_worker.get_values(), plot_path)
 
         # Save trim settings to file settings
         file_settings = self.settings.get_file_settings(self.fit_file.filename)
@@ -818,17 +810,24 @@ class AnalysisResult(QMainWindow):
         self.parent.show()
         self.close()
 
-    def async_update(self):
+    def on_plot_size_changed(self):
+        self.plot_size_info = self.ve_plot.get_size_info()
+        self.async_update(update_ve=False)
+
+    def async_update(self, update_ve=True):
         values = {}
         for key in VEWorker.INPUT_KEYS:
             values[key] = getattr(self, key)
+        values["update_ve"] = update_ve
         self.ve_worker.set_values(values)
 
     def on_ve_result_ready(self, res):
         for key in VEWorker.RESULT_KEYS:
             if key in res:
                 setattr(self, key, res[key])
-        self.update_plots()
+
+        self.ve_plot.set_fig(self.fig_res)
+        self.fig_res = None
 
     def join_threads(self):
         if self.map_widget:

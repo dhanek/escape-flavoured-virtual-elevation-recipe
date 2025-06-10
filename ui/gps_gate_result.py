@@ -8,8 +8,6 @@ from pathlib import Path
 import folium
 import numpy as np
 import pandas as pd
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
 from PySide6.QtCore import (Qt, QThread)
 from PySide6.QtWidgets import (
     QApplication,
@@ -37,6 +35,7 @@ from PySide6.QtWidgets import (
 from models.virtual_elevation import VirtualElevation
 from ui.map_widget import (MapWidget, MapMode)
 from ui.async_worker import AsyncWorker
+from ui.ve_plot import VEPlotLabel, VEFigure, VEPlotSaver
 
 
 class VEWorker(AsyncWorker):
@@ -47,6 +46,8 @@ class VEWorker(AsyncWorker):
         "current_crr",
         "detected_sections",
         "gate_sets",
+        "selected_section_indices",
+        "plot_size_info",
     ]
 
     RESULT_KEYS = [
@@ -55,29 +56,38 @@ class VEWorker(AsyncWorker):
         "all_actual_elevations",
         "mean_actual_elevations",
         "detected_sections",
+        "fig_res",
     ]
 
     def __init__(self, merged_data, params):
         super(VEWorker, self).__init__()
         self.merged_data = merged_data
         self.params = params
+        self.ve_valid = False
+        self.detected_sections = []
 
     def _process_value(self, values: dict):
         for key in VEWorker.INPUT_KEYS:
             if key in values:
                 setattr(self, key, values[key])
 
+        detect_sections = False
         # Detect sections with new gate positions
-        if values["detect_sections"]:
+        if values["detect_sections"] or not self.detected_sections:
             self.detect_sections()
+            detect_sections = True
 
         # Recalculate VE metrics and update plots
-        self.calculate_ve()
+        if values["update_ve"] or not self.ve_valid:
+            self.calculate_ve()
+            self.ve_valid = True
+
+        self.update_plots()
 
         out_values = {}
         for key in VEWorker.RESULT_KEYS:
             out_values[key] = getattr(self, key)
-        out_values["detect_sections"] = values["detect_sections"]
+        out_values["detect_sections"] = detect_sections
 
         return out_values
 
@@ -464,661 +474,13 @@ class VEWorker(AsyncWorker):
                     mean_elevation,
                 )
 
-class MplCanvas(FigureCanvas):
-    """Matplotlib canvas for embedding in Qt"""
-
-    def __init__(self, parent=None, width=5, height=4, dpi=100):
-        self.fig = Figure(figsize=(width, height), dpi=dpi)
-        self.axes = self.fig.add_subplot(111)
-        super().__init__(self.fig)
-        self.setParent(parent)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.updateGeometry()
-
-
-class GPSGateResult(QMainWindow):
-    """Window for displaying GPS gate one-way analysis results"""
-
-    def __init__(self, parent, fit_file, settings, selected_laps, params):
-        super().__init__()
-        self.parent = parent
-        self.fit_file = fit_file
-        self.settings = settings
-        self.selected_laps = selected_laps
-        self.params = params
-        self.result_dir = settings.result_dir
-        self.detected_sections = []
-        self.section_ve_profiles = []
-
-        # List of gate sets (each gate set has A and B)
-        self.gate_sets = []
-        self.active_set_index = -1  # Currently active gate set
-
-        # Initialize these attributes BEFORE calling prepare_merged_data
-        self.trim_start = 0
-        self.trim_end = 0
-
-        # Prepare merged lap data
-        self.prepare_merged_data()
-
-        self.ve_worker = VEWorker(self.merged_data, self.params)
-        self.ve_thread = QThread()
-        self.ve_worker.moveToThread(self.ve_thread)
-        self.ve_worker.resultReady.connect(self.on_ve_result_ready)
-        self.ve_thread.start()
-        QApplication.instance().aboutToQuit.connect(self.join_threads)
-
-        # Get lap combination ID for settings
-        self.lap_combo_id = "_".join(map(str, sorted(self.selected_laps)))
-        self.settings_key = f"GATE_lap_{self.lap_combo_id}"
-
-        # Try to load saved trim values for this lap combination
-        file_settings = self.settings.get_file_settings(self.fit_file.filename)
-        trim_settings = file_settings.get("trim_settings", {})
-        saved_trim = trim_settings.get(self.settings_key, {})
-
-        if saved_trim and "trim_start" in saved_trim and "trim_end" in saved_trim:
-            # Use saved trim values if available
-            self.trim_start = saved_trim["trim_start"]
-            self.trim_end = saved_trim["trim_end"]
-
-            # Load saved gates if available
-            if "gate_sets" in saved_trim:
-                # Create clean gate sets without previous sections
-                self.gate_sets = []
-                for gate_set in saved_trim["gate_sets"]:
-                    clean_gate = {
-                        "gate_a_pos": gate_set["gate_a_pos"],
-                        "gate_b_pos": gate_set["gate_b_pos"],
-                        "direction": gate_set.get("direction"),
-                        "calibration_point": None,  # Will be set during detection
-                        "sections": [],  # Empty sections list that will be filled during detection
-                    }
-                    self.gate_sets.append(clean_gate)
-
-                self.active_set_index = min(len(self.gate_sets) - 1, 0)
-
-        if not self.gate_sets:
-            self.add_gate_set()
-            self.active_set_index = min(len(self.gate_sets) - 1, 0)
-
-        # Initialize values for CdA and Crr
-        self.current_cda = self.params.get("cda")
-        self.current_crr = self.params.get("crr")
-
-        # If CdA or Crr are None (to be optimized), set initial values to middle of range
-        if self.current_cda is None:
-            if saved_trim and "cda" in saved_trim:
-                self.current_cda = saved_trim["cda"]
-            else:
-                self.current_cda = (
-                    self.params.get("cda_min", 0.15) + self.params.get("cda_max", 0.5)
-                ) / 2
-
-        if self.current_crr is None:
-            if saved_trim and "crr" in saved_trim:
-                self.current_crr = saved_trim["crr"]
-            else:
-                self.current_crr = (
-                    self.params.get("crr_min", 0.001) + self.params.get("crr_max", 0.03)
-                ) / 2
-
-        # Setup UI
-        self.initUI()
-
-        self.async_update(True)
-
-    def add_gate_set(self):
-        """Add a new gate set with default positions"""
-        # Set default gate positions
-        if not self.gate_sets:
-            # First gate set
-            gate_a_pos = self.trim_start + int((self.trim_end - self.trim_start) * 0.25)
-            gate_b_pos = self.trim_start + int((self.trim_end - self.trim_start) * 0.75)
-        else:
-            # Subsequent gate sets - position after the last one
-            last_gate_b = self.gate_sets[-1]["gate_b_pos"]
-            remaining_range = self.trim_end - last_gate_b
-
-            if remaining_range > 30:
-                gate_a_pos = last_gate_b + int(remaining_range * 0.33)
-                gate_b_pos = last_gate_b + int(remaining_range * 0.67)
-            else:
-                # Not enough room for another gate
-                return False
-
-        # Create new gate set
-        new_gate = {
-            "gate_a_pos": gate_a_pos,
-            "gate_b_pos": gate_b_pos,
-            "direction": None,  # Will be set on first passing
-            "calibration_point": None,  # Will be used to track calibration pass
-            "sections": [],  # Will hold detected sections
-        }
-
-        self.gate_sets.append(new_gate)
-        self.active_set_index = len(self.gate_sets) - 1
-        return True
-
-    def prepare_merged_data(self):
-        """Extract and merge data for selected laps"""
-        # Get records for selected laps
-        self.merged_data = self.fit_file.get_records_for_laps(self.selected_laps)
-
-        # Check if we have enough data
-        if len(self.merged_data) < 30:
-            raise ValueError("Not enough data points (less than 30 seconds)")
-
-        # Get lap info for display
-        self.lap_info = []
-        all_laps = self.fit_file.get_lap_data()
-
-        for lap in all_laps:
-            if lap["lap_number"] in self.selected_laps:
-                self.lap_info.append(lap)
-
-        # Calculate distance, duration, etc. for the merged lap
-        self.total_distance = sum(lap["distance"] for lap in self.lap_info)
-        self.total_duration = sum(lap["duration"] for lap in self.lap_info)
-        self.avg_power = np.mean(self.merged_data["power"].dropna())
-        self.avg_speed = (
-            (self.total_distance / self.total_duration) * 3600
-            if self.total_duration > 0
-            else 0
-        )
-
-        # Extract GPS coordinates for map
-        if (
-            "position_lat" in self.merged_data.columns
-            and "position_long" in self.merged_data.columns
-        ):
-            self.has_gps = True
-            # Filter out missing coordinates
-            valid_coords = self.merged_data.dropna(
-                subset=["position_lat", "position_long"]
-            )
-            if not valid_coords.empty:
-                self.start_lat = valid_coords["position_lat"].iloc[0]
-                self.start_lon = valid_coords["position_long"].iloc[0]
-                self.end_lat = valid_coords["position_lat"].iloc[-1]
-                self.end_lon = valid_coords["position_long"].iloc[-1]
-
-                # Extract all route points
-                self.route_points = list(
-                    zip(valid_coords["position_lat"], valid_coords["position_long"])
-                )
-
-                # Store the timestamps to ensure correct mapping of trim indices to route points
-                self.route_timestamps = valid_coords["timestamp"].tolist()
-
-                # Initial trim values should correspond to the valid coordinates
-                if self.trim_start == 0 and self.trim_end == 0:
-                    self.trim_start = 0
-                    self.trim_end = len(valid_coords) - 1
-            else:
-                self.has_gps = False
-        else:
-            self.has_gps = False
-
-    def initUI(self):
-        """Initialize the UI components"""
-        self.setWindowTitle(
-            f'GPS Gate Analysis - Laps {", ".join(map(str, self.selected_laps))}'
-        )
-        self.setGeometry(50, 50, 1200, 800)
-
-        # Main widget and layout
-        main_widget = QWidget()
-        main_layout = QVBoxLayout()
-
-        # Create a splitter for adjustable panels
-        splitter = QSplitter(Qt.Horizontal)
-
-        # Left side - Map and controls
-        left_widget = QWidget()
-        left_layout = QVBoxLayout(left_widget)
-
-        # Map
-        self.map_widget = MapWidget(MapMode.MARKER_GATE_SETS, self.merged_data, self.params)
-        if self.map_widget.has_gps():
-            self.map_widget.set_trim_start(self.trim_start)
-            self.map_widget.set_trim_end(self.trim_end)
-            self.map_widget.set_gate_sets(self.gate_sets, self.detected_sections)
-            self.map_widget.update()
-            left_layout.addWidget(self.map_widget, 2)
-        else:
-            no_gps_label = QLabel("No GPS data available")
-            no_gps_label.setAlignment(Qt.AlignCenter)
-            left_layout.addWidget(no_gps_label, 2)
-
-        # Detected sections table
-        section_table_group = QGroupBox("Detected Sections")
-        section_table_layout = QVBoxLayout()
-
-        self.section_table = QTableWidget()
-        self.section_table.setColumnCount(5)
-        self.section_table.setHorizontalHeaderLabels(
-            ["Select", "Section", "Gate Set", "Duration", "Distance"]
-        )
-        section_table_layout.addWidget(self.section_table)
-
-        section_table_group.setLayout(section_table_layout)
-        left_layout.addWidget(section_table_group, 1)
-
-        # Parameter display
-        param_group = QGroupBox("Analysis Parameters")
-        param_layout = QFormLayout()
-
-        self.config_text = QTextEdit()
-        self.config_text.setReadOnly(True)
-        self.update_config_text()
-        param_layout.addRow("Configuration:", self.config_text)
-
-        # Configuration name input
-        self.config_name = QLineEdit("GPS Gate Test")
-        param_layout.addRow("Save as:", self.config_name)
-
-        param_group.setLayout(param_layout)
-        left_layout.addWidget(param_group, 1)
-
-        # Control buttons
-        button_layout = QHBoxLayout()
-
-        self.back_button = QPushButton("Back to Lap Selection")
-        self.back_button.clicked.connect(self.back_to_selection)
-
-        self.close_button = QPushButton("Close App")
-        self.close_button.clicked.connect(self.close)
-
-        self.save_button = QPushButton("Save Results")
-        self.save_button.clicked.connect(self.save_results)
-        self.save_button.setStyleSheet(f"background-color: #4363d8; color: white;")
-
-        button_layout.addWidget(self.back_button)
-        button_layout.addWidget(self.close_button)
-        button_layout.addWidget(self.save_button)
-
-        left_layout.addLayout(button_layout)
-
-        # Right side - Plots and sliders
-        right_widget = QWidget()
-        right_layout = QVBoxLayout(right_widget)
-
-        # Plot area
-        plot_widget = QWidget()
-        plot_layout = QVBoxLayout(plot_widget)
-
-        # Create plots
-        self.fig_canvas = MplCanvas(self, width=5, height=4, dpi=100)
-        plot_layout.addWidget(self.fig_canvas)
-
-        right_layout.addWidget(plot_widget, 3)
-
-        # Sliders
-        slider_container = QScrollArea()
-        slider_container.setWidgetResizable(True)
-        slider_content = QWidget()
-        slider_content_layout = QVBoxLayout(slider_content)
-
-        # Main trim sliders
-        trim_group = QGroupBox("Trim Settings")
-        trim_layout = QFormLayout()
-
-        # Trim start slider
-        self.trim_start_slider = QSlider(Qt.Horizontal)
-        self.trim_start_slider.setMinimum(0)
-        self.trim_start_slider.setMaximum(len(self.merged_data) - 30)
-        self.trim_start_slider.setValue(self.trim_start)
-        self.trim_start_slider.valueChanged.connect(self.on_trim_start_changed)
-
-        self.trim_start_label = QLabel(f"{self.trim_start} s")
-        trim_start_layout = QHBoxLayout()
-        trim_start_layout.addWidget(self.trim_start_slider)
-        trim_start_layout.addWidget(self.trim_start_label)
-
-        trim_layout.addRow("Trim Start:", trim_start_layout)
-
-        # Trim end slider
-        self.trim_end_slider = QSlider(Qt.Horizontal)
-        self.trim_end_slider.setMinimum(30)
-        self.trim_end_slider.setMaximum(len(self.merged_data))
-        self.trim_end_slider.setValue(self.trim_end)
-        self.trim_end_slider.valueChanged.connect(self.on_trim_end_changed)
-
-        self.trim_end_label = QLabel(f"{self.trim_end} s")
-        trim_end_layout = QHBoxLayout()
-        trim_end_layout.addWidget(self.trim_end_slider)
-        trim_end_layout.addWidget(self.trim_end_label)
-
-        trim_layout.addRow("Trim End:", trim_end_layout)
-
-        trim_group.setLayout(trim_layout)
-        slider_content_layout.addWidget(trim_group)
-
-        # Create gate set controls
-        self.gate_controls = []
-        for i, gate_set in enumerate(self.gate_sets):
-            gate_control = self.create_gate_control_group(i)
-            slider_content_layout.addWidget(gate_control)
-            self.gate_controls.append(gate_control)
-
-        # Add gate set buttons
-        gate_buttons_layout = QHBoxLayout()
-
-        self.add_gate_button = QPushButton("Add Gate Set")
-        self.add_gate_button.clicked.connect(self.on_add_gate_set)
-        gate_buttons_layout.addWidget(self.add_gate_button)
-
-        self.remove_gate_button = QPushButton("Remove Last Gate Set")
-        self.remove_gate_button.clicked.connect(self.remove_last_gate_set)
-        gate_buttons_layout.addWidget(self.remove_gate_button)
-
-        slider_content_layout.addLayout(gate_buttons_layout)
-
-        # Then make sure to initialize the remove button state
-        self.update_remove_gate_button()
-
-        # Update the enabled state of the add button
-        self.update_add_gate_button()
-
-        # CdA and Crr sliders
-        params_group = QGroupBox("Parameters")
-        params_layout = QFormLayout()
-
-        # CdA slider
-        self.cda_slider = QSlider(Qt.Horizontal)
-        self.cda_slider.setMinimum(int(self.params.get("cda_min", 0.15) * 1000))
-        self.cda_slider.setMaximum(int(self.params.get("cda_max", 0.5) * 1000))
-        self.cda_slider.setValue(int(self.current_cda * 1000))
-        self.cda_slider.valueChanged.connect(self.on_cda_changed)
-        self.cda_slider.setEnabled(self.params.get("cda") is None)
-
-        self.cda_label = QLabel(f"{self.current_cda:.3f}")
-        cda_layout = QHBoxLayout()
-        cda_layout.addWidget(self.cda_slider)
-        cda_layout.addWidget(self.cda_label)
-
-        params_layout.addRow("CdA:", cda_layout)
-
-        # Crr slider
-        self.crr_slider = QSlider(Qt.Horizontal)
-        self.crr_slider.setMinimum(int(self.params.get("crr_min", 0.001) * 10000))
-        self.crr_slider.setMaximum(int(self.params.get("crr_max", 0.03) * 10000))
-        self.crr_slider.setValue(int(self.current_crr * 10000))
-        self.crr_slider.valueChanged.connect(self.on_crr_changed)
-        self.crr_slider.setEnabled(self.params.get("crr") is None)
-
-        self.crr_label = QLabel(f"{self.current_crr:.4f}")
-        crr_layout = QHBoxLayout()
-        crr_layout.addWidget(self.crr_slider)
-        crr_layout.addWidget(self.crr_label)
-
-        params_layout.addRow("Crr:", crr_layout)
-
-        params_group.setLayout(params_layout)
-        slider_content_layout.addWidget(params_group)
-
-        # Add a stretch at the end to push everything up
-        slider_content_layout.addStretch()
-
-        # Set the content widget for the scroll area
-        slider_container.setWidget(slider_content)
-        right_layout.addWidget(slider_container, 1)
-
-        # Add widgets to splitter
-        splitter.addWidget(left_widget)
-        splitter.addWidget(right_widget)
-        splitter.setSizes([400, 800])  # Set initial sizes
-
-        # Add splitter to main layout
-        main_layout.addWidget(splitter)
-
-        main_widget.setLayout(main_layout)
-        self.setCentralWidget(main_widget)
-
-    def create_gate_control_group(self, gate_index):
-        """Create a control group for a gate set"""
-        gate_set = self.gate_sets[gate_index]
-
-        group = QGroupBox(f"Gate Set {gate_index + 1}")
-        layout = QFormLayout()
-
-        # Gate A slider
-        gate_a_slider = QSlider(Qt.Horizontal)
-        gate_a_slider.setMinimum(self.trim_start)
-        gate_a_slider.setMaximum(self.trim_end)
-        gate_a_slider.setValue(gate_set["gate_a_pos"])
-        gate_a_slider.valueChanged.connect(
-            lambda value: self.on_gate_a_changed(gate_index, value)
-        )
-
-        gate_a_label = QLabel(f"{gate_set['gate_a_pos']} s")
-        gate_a_layout = QHBoxLayout()
-        gate_a_layout.addWidget(gate_a_slider)
-        gate_a_layout.addWidget(gate_a_label)
-
-        layout.addRow(f"Gate {gate_index + 1}A:", gate_a_layout)
-
-        # Gate B slider
-        gate_b_slider = QSlider(Qt.Horizontal)
-        gate_b_slider.setMinimum(gate_set["gate_a_pos"])
-        gate_b_slider.setMaximum(self.trim_end)
-        gate_b_slider.setValue(gate_set["gate_b_pos"])
-        gate_b_slider.valueChanged.connect(
-            lambda value: self.on_gate_b_changed(gate_index, value)
-        )
-
-        gate_b_label = QLabel(f"{gate_set['gate_b_pos']} s")
-        gate_b_layout = QHBoxLayout()
-        gate_b_layout.addWidget(gate_b_slider)
-        gate_b_layout.addWidget(gate_b_label)
-
-        layout.addRow(f"Gate {gate_index + 1}B:", gate_b_layout)
-
-        group.setLayout(layout)
-
-        # Store the sliders and labels for later access
-        group.gate_a_slider = gate_a_slider
-        group.gate_a_label = gate_a_label
-        group.gate_b_slider = gate_b_slider
-        group.gate_b_label = gate_b_label
-
-        return group
-
-    def update_gate_controls(self):
-        """Update all gate controls' states and values"""
-        # First, ensure we have the right number of controls
-        while len(self.gate_controls) < len(self.gate_sets):
-            # Add new control
-            index = len(self.gate_controls)
-            gate_control = self.create_gate_control_group(index)
-            self.gate_controls.append(gate_control)
-
-            # Add to the layout, before the "Add Gate Set" button
-            layout = self.add_gate_button.parentWidget().layout()
-            layout.insertWidget(
-                layout.count() - 2, gate_control
-            )  # Insert before the add button and stretch
-
-        # Update minimums, maximums, and values
-        for i, gate_control in enumerate(self.gate_controls):
-            gate_set = self.gate_sets[i]
-
-            # Update Gate A slider
-            min_a = self.trim_start
-            if i > 0:
-                # A cannot be before previous B
-                min_a = max(min_a, self.gate_sets[i - 1]["gate_b_pos"])
-
-            gate_control.gate_a_slider.setMinimum(min_a)
-            gate_control.gate_a_slider.setMaximum(self.trim_end - 1)  # Leave room for B
-            gate_control.gate_a_slider.setValue(gate_set["gate_a_pos"])
-            gate_control.gate_a_label.setText(f"{gate_set['gate_a_pos']} s")
-
-            # Update Gate B slider
-            gate_control.gate_b_slider.setMinimum(
-                gate_set["gate_a_pos"] + 1
-            )  # B must be after A
-            gate_control.gate_b_slider.setMaximum(self.trim_end)
-            gate_control.gate_b_slider.setValue(gate_set["gate_b_pos"])
-            gate_control.gate_b_label.setText(f"{gate_set['gate_b_pos']} s")
-
-        # Update the add gate button state
-        self.update_add_gate_button()
-
-    def remove_last_gate_set(self):
-        """Remove the last gate set if there are more than one"""
-        if len(self.gate_sets) > 1:
-            # Remove the last gate set
-            self.gate_sets.pop()
-
-            # Update active set index to the new last set
-            self.active_set_index = len(self.gate_sets) - 1
-
-            # Remove the last control from the UI
-            if self.gate_controls:
-                last_control = self.gate_controls.pop()
-                last_control.setParent(None)  # Remove from layout
-                last_control.deleteLater()  # Schedule for deletion
-
-            # Update the UI controls
-            self.update_remove_gate_button()
-
-            # Re-detect sections with the updated gate sets
-            self.async_update(True)
-
-            self.map_widget.set_gate_sets(self.gate_sets, self.detected_sections)
-            self.map_widget.update()
-
-            return True
-        return False
-
-    def update_remove_gate_button(self):
-        """Update the enabled state of the remove gate button"""
-        # Enable only if there's more than one gate set
-        self.remove_gate_button.setEnabled(len(self.gate_sets) > 1)
-
-    def update_add_gate_button(self):
-        """Update the enabled state of the add gate button"""
-        # Enable only if there's room for another gate set
-        if not self.gate_sets:
-            self.add_gate_button.setEnabled(True)
-            return
-
-        last_gate_b = self.gate_sets[-1]["gate_b_pos"]
-        remaining_range = self.trim_end - last_gate_b
-
-        # Need at least 30 seconds for a new gate set
-        self.add_gate_button.setEnabled(remaining_range >= 30)
-
-        # Also update the remove button
-        self.update_remove_gate_button()
-
-    def on_add_gate_set(self):
-        """Handle adding a new gate set"""
-        if self.add_gate_set():
-            self.update_gate_controls()
-            self.async_update(True)
-            self.map_widget.set_gate_sets(self.gate_sets, self.detected_sections)
-            self.map_widget.update()
-
-    def update_config_text(self):
-        """Update the configuration text display"""
-        lap_str = ", ".join(map(str, self.selected_laps))
-        distance_str = f"{self.total_distance:.2f} km"
-        duration_str = f"{self.total_duration:.0f} s"
-        power_str = f"{self.avg_power:.0f} W"
-        # Convert speed from m/s to km/h for display
-        speed_str = f"{self.avg_speed:.2f} km/h"
-
-        config_text = f"Selected Laps: {lap_str}\n"
-        config_text += f"Distance: {distance_str}\n"
-        config_text += f"Duration: {duration_str}\n"
-        config_text += f"Avg Power: {power_str}\n"
-        config_text += f"Avg Speed: {speed_str}\n"
-        config_text += f"System Mass: {self.params.get('system_mass', 90)} kg\n"
-        config_text += f"Rho (air density): {self.params.get('rho', 1.2)} kg/m³\n"
-        config_text += f"Eta (drivetrain eff.): {self.params.get('eta', 0.98)}\n"
-        config_text += f"Current CdA: {self.current_cda:.3f}\n"
-        config_text += f"Current Crr: {self.current_crr:.4f}\n"
-
-        if self.params.get("wind_speed") not in [None, 0]:
-            config_text += f"Wind Speed: {self.params.get('wind_speed')} m/s\n"
-
-        if self.params.get("wind_direction") is not None:
-            config_text += f"Wind Direction: {self.params.get('wind_direction')}°"
-
-        self.config_text.setText(config_text)
-
-    def update_section_table(self):
-        """Update the section table with detected sections"""
-        self.section_table.setRowCount(len(self.detected_sections))
-
-        for row, section in enumerate(self.detected_sections):
-            # Checkbox for selection
-            checkbox = QCheckBox()
-            checkbox.setChecked(True)  # All sections selected by default
-            checkbox.stateChanged.connect(self.update_plots)
-            self.section_table.setCellWidget(row, 0, checkbox)
-
-            # Section number
-            self.section_table.setItem(
-                row, 1, QTableWidgetItem(str(section["section_id"]))
-            )
-
-            # Gate set
-            self.section_table.setItem(
-                row, 2, QTableWidgetItem(f"Gate {section['gate_set']+1}")
-            )
-
-            # Duration
-            duration_mins = int(section["duration"] // 60)
-            duration_secs = int(section["duration"] % 60)
-            self.section_table.setItem(
-                row, 3, QTableWidgetItem(f"{duration_mins:02d}:{duration_secs:02d}")
-            )
-
-            # Distance
-            self.section_table.setItem(
-                row, 4, QTableWidgetItem(f"{section['distance']:.2f} km")
-            )
-
-            # Make cells read-only
-            for col in range(1, 5):
-                item = self.section_table.item(row, col)
-                if item:
-                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-
-        # Resize columns to fit content
-        header = self.section_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        for i in range(1, 5):
-            header.setSectionResizeMode(i, QHeaderView.Stretch)
-
-    def get_selected_section_indices(self):
-        """Get indices of selected sections in the table"""
-        selected_indices = []
-
-        for row in range(self.section_table.rowCount()):
-            checkbox = self.section_table.cellWidget(row, 0)
-            if checkbox and checkbox.isChecked():
-                selected_indices.append(row)
-
-        return selected_indices
-
     def update_plots(self):
         """Update the virtual elevation plots"""
-        # Clear previous plots
-        self.fig_canvas.axes.clear()
-
-        # Create figure with two subplots
-        self.fig_canvas.fig.clear()
-        gs = self.fig_canvas.fig.add_gridspec(2, 1, height_ratios=[3, 1])
-        ax1 = self.fig_canvas.fig.add_subplot(gs[0])
-        ax2 = self.fig_canvas.fig.add_subplot(gs[1])
+        ve_fig = VEFigure(self.plot_size_info)
+        fig, ax1, ax2 = ve_fig.get_fig_axes()
 
         # Get selected section indices
-        selected_indices = self.get_selected_section_indices()
+        selected_indices = self.selected_section_indices
 
         if not selected_indices or not self.section_ve_profiles:
             # No sections selected or detected
@@ -1368,18 +730,658 @@ class GPSGateResult(QMainWindow):
             crr_str = f"Crr: {self.current_crr:.4f}"
             error_str = f"Total Error: {total_error:.2f} m"
 
-            self.fig_canvas.fig.text(
+            fig.text(
                 0.01,
                 0.99,
                 cda_str + "\n" + crr_str + "\n" + error_str,
                 verticalalignment="top",
                 horizontalalignment="left",
-                transform=self.fig_canvas.fig.transFigure,
+                transform=fig.transFigure,
                 bbox=dict(boxstyle="round", facecolor="white", alpha=0.9),
             )
 
-        self.fig_canvas.fig.tight_layout()
-        self.fig_canvas.draw_idle()
+        self.fig_res = ve_fig.draw()
+
+class GPSGateResult(QMainWindow):
+    """Window for displaying GPS gate one-way analysis results"""
+
+    def __init__(self, parent, fit_file, settings, selected_laps, params):
+        super().__init__()
+        self.parent = parent
+        self.fit_file = fit_file
+        self.settings = settings
+        self.selected_laps = selected_laps
+        self.params = params
+        self.result_dir = settings.result_dir
+        self.detected_sections = []
+        self.section_ve_profiles = []
+
+        # List of gate sets (each gate set has A and B)
+        self.gate_sets = []
+        self.active_set_index = -1  # Currently active gate set
+
+        # Initialize these attributes BEFORE calling prepare_merged_data
+        self.trim_start = 0
+        self.trim_end = 0
+
+        # Prepare merged lap data
+        self.prepare_merged_data()
+
+        self.ve_worker = VEWorker(self.merged_data, self.params)
+        self.ve_thread = QThread()
+        self.ve_worker.moveToThread(self.ve_thread)
+        self.ve_worker.resultReady.connect(self.on_ve_result_ready)
+        self.ve_plot_saver = VEPlotSaver(VEWorker(self.merged_data, self.params),
+                                         self.ve_thread)
+        self.ve_thread.start()
+        QApplication.instance().aboutToQuit.connect(self.join_threads)
+
+        # Get lap combination ID for settings
+        self.lap_combo_id = "_".join(map(str, sorted(self.selected_laps)))
+        self.settings_key = f"GATE_lap_{self.lap_combo_id}"
+
+        # Try to load saved trim values for this lap combination
+        file_settings = self.settings.get_file_settings(self.fit_file.filename)
+        trim_settings = file_settings.get("trim_settings", {})
+        saved_trim = trim_settings.get(self.settings_key, {})
+
+        if saved_trim and "trim_start" in saved_trim and "trim_end" in saved_trim:
+            # Use saved trim values if available
+            self.trim_start = saved_trim["trim_start"]
+            self.trim_end = saved_trim["trim_end"]
+
+            # Load saved gates if available
+            if "gate_sets" in saved_trim:
+                # Create clean gate sets without previous sections
+                self.gate_sets = []
+                for gate_set in saved_trim["gate_sets"]:
+                    clean_gate = {
+                        "gate_a_pos": gate_set["gate_a_pos"],
+                        "gate_b_pos": gate_set["gate_b_pos"],
+                        "direction": gate_set.get("direction"),
+                        "calibration_point": None,  # Will be set during detection
+                        "sections": [],  # Empty sections list that will be filled during detection
+                    }
+                    self.gate_sets.append(clean_gate)
+
+                self.active_set_index = min(len(self.gate_sets) - 1, 0)
+
+        if not self.gate_sets:
+            self.add_gate_set()
+            self.active_set_index = min(len(self.gate_sets) - 1, 0)
+
+        # Initialize values for CdA and Crr
+        self.current_cda = self.params.get("cda")
+        self.current_crr = self.params.get("crr")
+
+        # If CdA or Crr are None (to be optimized), set initial values to middle of range
+        if self.current_cda is None:
+            if saved_trim and "cda" in saved_trim:
+                self.current_cda = saved_trim["cda"]
+            else:
+                self.current_cda = (
+                    self.params.get("cda_min", 0.15) + self.params.get("cda_max", 0.5)
+                ) / 2
+
+        if self.current_crr is None:
+            if saved_trim and "crr" in saved_trim:
+                self.current_crr = saved_trim["crr"]
+            else:
+                self.current_crr = (
+                    self.params.get("crr_min", 0.001) + self.params.get("crr_max", 0.03)
+                ) / 2
+
+        # Setup UI
+        self.initUI()
+
+        self.async_update()
+        self.ve_plot.sizeChanged.connect(self.on_plot_size_changed)
+
+    def add_gate_set(self):
+        """Add a new gate set with default positions"""
+        # Set default gate positions
+        if not self.gate_sets:
+            # First gate set
+            gate_a_pos = self.trim_start + int((self.trim_end - self.trim_start) * 0.25)
+            gate_b_pos = self.trim_start + int((self.trim_end - self.trim_start) * 0.75)
+        else:
+            # Subsequent gate sets - position after the last one
+            last_gate_b = self.gate_sets[-1]["gate_b_pos"]
+            remaining_range = self.trim_end - last_gate_b
+
+            if remaining_range > 30:
+                gate_a_pos = last_gate_b + int(remaining_range * 0.33)
+                gate_b_pos = last_gate_b + int(remaining_range * 0.67)
+            else:
+                # Not enough room for another gate
+                return False
+
+        # Create new gate set
+        new_gate = {
+            "gate_a_pos": gate_a_pos,
+            "gate_b_pos": gate_b_pos,
+            "direction": None,  # Will be set on first passing
+            "calibration_point": None,  # Will be used to track calibration pass
+            "sections": [],  # Will hold detected sections
+        }
+
+        self.gate_sets.append(new_gate)
+        self.active_set_index = len(self.gate_sets) - 1
+        return True
+
+    def prepare_merged_data(self):
+        """Extract and merge data for selected laps"""
+        # Get records for selected laps
+        self.merged_data = self.fit_file.get_records_for_laps(self.selected_laps)
+
+        # Check if we have enough data
+        if len(self.merged_data) < 30:
+            raise ValueError("Not enough data points (less than 30 seconds)")
+
+        # Get lap info for display
+        self.lap_info = []
+        all_laps = self.fit_file.get_lap_data()
+
+        for lap in all_laps:
+            if lap["lap_number"] in self.selected_laps:
+                self.lap_info.append(lap)
+
+        # Calculate distance, duration, etc. for the merged lap
+        self.total_distance = sum(lap["distance"] for lap in self.lap_info)
+        self.total_duration = sum(lap["duration"] for lap in self.lap_info)
+        self.avg_power = np.mean(self.merged_data["power"].dropna())
+        self.avg_speed = (
+            (self.total_distance / self.total_duration) * 3600
+            if self.total_duration > 0
+            else 0
+        )
+
+        # Extract GPS coordinates for map
+        if (
+            "position_lat" in self.merged_data.columns
+            and "position_long" in self.merged_data.columns
+        ):
+            self.has_gps = True
+            # Filter out missing coordinates
+            valid_coords = self.merged_data.dropna(
+                subset=["position_lat", "position_long"]
+            )
+            if not valid_coords.empty:
+                self.start_lat = valid_coords["position_lat"].iloc[0]
+                self.start_lon = valid_coords["position_long"].iloc[0]
+                self.end_lat = valid_coords["position_lat"].iloc[-1]
+                self.end_lon = valid_coords["position_long"].iloc[-1]
+
+                # Extract all route points
+                self.route_points = list(
+                    zip(valid_coords["position_lat"], valid_coords["position_long"])
+                )
+
+                # Store the timestamps to ensure correct mapping of trim indices to route points
+                self.route_timestamps = valid_coords["timestamp"].tolist()
+
+                # Initial trim values should correspond to the valid coordinates
+                if self.trim_start == 0 and self.trim_end == 0:
+                    self.trim_start = 0
+                    self.trim_end = len(valid_coords) - 1
+            else:
+                self.has_gps = False
+        else:
+            self.has_gps = False
+
+    def initUI(self):
+        """Initialize the UI components"""
+        self.setWindowTitle(
+            f'GPS Gate Analysis - Laps {", ".join(map(str, self.selected_laps))}'
+        )
+        self.setGeometry(50, 50, 1200, 800)
+
+        # Main widget and layout
+        main_widget = QWidget()
+        main_layout = QVBoxLayout()
+
+        # Create a splitter for adjustable panels
+        splitter = QSplitter(Qt.Horizontal)
+
+        # Left side - Map and controls
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+
+        # Map
+        self.map_widget = MapWidget(MapMode.MARKER_GATE_SETS, self.merged_data, self.params)
+        if self.map_widget.has_gps():
+            self.map_widget.set_trim_start(self.trim_start)
+            self.map_widget.set_trim_end(self.trim_end)
+            self.map_widget.set_gate_sets(self.gate_sets, self.detected_sections)
+            self.map_widget.update()
+            left_layout.addWidget(self.map_widget, 2)
+        else:
+            no_gps_label = QLabel("No GPS data available")
+            no_gps_label.setAlignment(Qt.AlignCenter)
+            left_layout.addWidget(no_gps_label, 2)
+
+        # Detected sections table
+        section_table_group = QGroupBox("Detected Sections")
+        section_table_layout = QVBoxLayout()
+
+        self.section_table = QTableWidget()
+        self.section_table.setColumnCount(5)
+        self.section_table.setHorizontalHeaderLabels(
+            ["Select", "Section", "Gate Set", "Duration", "Distance"]
+        )
+        section_table_layout.addWidget(self.section_table)
+
+        section_table_group.setLayout(section_table_layout)
+        left_layout.addWidget(section_table_group, 1)
+
+        # Parameter display
+        param_group = QGroupBox("Analysis Parameters")
+        param_layout = QFormLayout()
+
+        self.config_text = QTextEdit()
+        self.config_text.setReadOnly(True)
+        self.update_config_text()
+        param_layout.addRow("Configuration:", self.config_text)
+
+        # Configuration name input
+        self.config_name = QLineEdit("GPS Gate Test")
+        param_layout.addRow("Save as:", self.config_name)
+
+        param_group.setLayout(param_layout)
+        left_layout.addWidget(param_group, 1)
+
+        # Control buttons
+        button_layout = QHBoxLayout()
+
+        self.back_button = QPushButton("Back to Lap Selection")
+        self.back_button.clicked.connect(self.back_to_selection)
+
+        self.close_button = QPushButton("Close App")
+        self.close_button.clicked.connect(self.close)
+
+        self.save_button = QPushButton("Save Results")
+        self.save_button.clicked.connect(self.save_results)
+        self.save_button.setStyleSheet(f"background-color: #4363d8; color: white;")
+
+        button_layout.addWidget(self.back_button)
+        button_layout.addWidget(self.close_button)
+        button_layout.addWidget(self.save_button)
+
+        left_layout.addLayout(button_layout)
+
+        # Right side - Plots and sliders
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+
+        # Plot area
+        plot_widget = QWidget()
+        plot_layout = QVBoxLayout(plot_widget)
+
+        # Create plots
+        self.ve_plot = VEPlotLabel(self.screen())
+        plot_layout.addWidget(self.ve_plot)
+
+        right_layout.addWidget(plot_widget, 3)
+        self.plot_size_info = self.ve_plot.get_size_info()
+
+        # Sliders
+        slider_container = QScrollArea()
+        slider_container.setWidgetResizable(True)
+        slider_content = QWidget()
+        slider_content_layout = QVBoxLayout(slider_content)
+
+        # Main trim sliders
+        trim_group = QGroupBox("Trim Settings")
+        trim_layout = QFormLayout()
+
+        # Trim start slider
+        self.trim_start_slider = QSlider(Qt.Horizontal)
+        self.trim_start_slider.setMinimum(0)
+        self.trim_start_slider.setMaximum(len(self.merged_data) - 30)
+        self.trim_start_slider.setValue(self.trim_start)
+        self.trim_start_slider.valueChanged.connect(self.on_trim_start_changed)
+
+        self.trim_start_label = QLabel(f"{self.trim_start} s")
+        trim_start_layout = QHBoxLayout()
+        trim_start_layout.addWidget(self.trim_start_slider)
+        trim_start_layout.addWidget(self.trim_start_label)
+
+        trim_layout.addRow("Trim Start:", trim_start_layout)
+
+        # Trim end slider
+        self.trim_end_slider = QSlider(Qt.Horizontal)
+        self.trim_end_slider.setMinimum(30)
+        self.trim_end_slider.setMaximum(len(self.merged_data))
+        self.trim_end_slider.setValue(self.trim_end)
+        self.trim_end_slider.valueChanged.connect(self.on_trim_end_changed)
+
+        self.trim_end_label = QLabel(f"{self.trim_end} s")
+        trim_end_layout = QHBoxLayout()
+        trim_end_layout.addWidget(self.trim_end_slider)
+        trim_end_layout.addWidget(self.trim_end_label)
+
+        trim_layout.addRow("Trim End:", trim_end_layout)
+
+        trim_group.setLayout(trim_layout)
+        slider_content_layout.addWidget(trim_group)
+
+        # Create gate set controls
+        self.gate_controls = []
+        for i, gate_set in enumerate(self.gate_sets):
+            gate_control = self.create_gate_control_group(i)
+            slider_content_layout.addWidget(gate_control)
+            self.gate_controls.append(gate_control)
+
+        # Add gate set buttons
+        gate_buttons_layout = QHBoxLayout()
+
+        self.add_gate_button = QPushButton("Add Gate Set")
+        self.add_gate_button.clicked.connect(self.on_add_gate_set)
+        gate_buttons_layout.addWidget(self.add_gate_button)
+
+        self.remove_gate_button = QPushButton("Remove Last Gate Set")
+        self.remove_gate_button.clicked.connect(self.remove_last_gate_set)
+        gate_buttons_layout.addWidget(self.remove_gate_button)
+
+        slider_content_layout.addLayout(gate_buttons_layout)
+
+        # Then make sure to initialize the remove button state
+        self.update_remove_gate_button()
+
+        # Update the enabled state of the add button
+        self.update_add_gate_button()
+
+        # CdA and Crr sliders
+        params_group = QGroupBox("Parameters")
+        params_layout = QFormLayout()
+
+        # CdA slider
+        self.cda_slider = QSlider(Qt.Horizontal)
+        self.cda_slider.setMinimum(int(self.params.get("cda_min", 0.15) * 1000))
+        self.cda_slider.setMaximum(int(self.params.get("cda_max", 0.5) * 1000))
+        self.cda_slider.setValue(int(self.current_cda * 1000))
+        self.cda_slider.valueChanged.connect(self.on_cda_changed)
+        self.cda_slider.setEnabled(self.params.get("cda") is None)
+
+        self.cda_label = QLabel(f"{self.current_cda:.3f}")
+        cda_layout = QHBoxLayout()
+        cda_layout.addWidget(self.cda_slider)
+        cda_layout.addWidget(self.cda_label)
+
+        params_layout.addRow("CdA:", cda_layout)
+
+        # Crr slider
+        self.crr_slider = QSlider(Qt.Horizontal)
+        self.crr_slider.setMinimum(int(self.params.get("crr_min", 0.001) * 10000))
+        self.crr_slider.setMaximum(int(self.params.get("crr_max", 0.03) * 10000))
+        self.crr_slider.setValue(int(self.current_crr * 10000))
+        self.crr_slider.valueChanged.connect(self.on_crr_changed)
+        self.crr_slider.setEnabled(self.params.get("crr") is None)
+
+        self.crr_label = QLabel(f"{self.current_crr:.4f}")
+        crr_layout = QHBoxLayout()
+        crr_layout.addWidget(self.crr_slider)
+        crr_layout.addWidget(self.crr_label)
+
+        params_layout.addRow("Crr:", crr_layout)
+
+        params_group.setLayout(params_layout)
+        slider_content_layout.addWidget(params_group)
+
+        # Add a stretch at the end to push everything up
+        slider_content_layout.addStretch()
+
+        # Set the content widget for the scroll area
+        slider_container.setWidget(slider_content)
+        right_layout.addWidget(slider_container, 1)
+
+        # Add widgets to splitter
+        splitter.addWidget(left_widget)
+        splitter.addWidget(right_widget)
+        splitter.setSizes([400, 800])  # Set initial sizes
+
+        # Add splitter to main layout
+        main_layout.addWidget(splitter)
+
+        main_widget.setLayout(main_layout)
+        self.setCentralWidget(main_widget)
+
+    def create_gate_control_group(self, gate_index):
+        """Create a control group for a gate set"""
+        gate_set = self.gate_sets[gate_index]
+
+        group = QGroupBox(f"Gate Set {gate_index + 1}")
+        layout = QFormLayout()
+
+        # Gate A slider
+        gate_a_slider = QSlider(Qt.Horizontal)
+        gate_a_slider.setMinimum(self.trim_start)
+        gate_a_slider.setMaximum(self.trim_end)
+        gate_a_slider.setValue(gate_set["gate_a_pos"])
+        gate_a_slider.valueChanged.connect(
+            lambda value: self.on_gate_a_changed(gate_index, value)
+        )
+
+        gate_a_label = QLabel(f"{gate_set['gate_a_pos']} s")
+        gate_a_layout = QHBoxLayout()
+        gate_a_layout.addWidget(gate_a_slider)
+        gate_a_layout.addWidget(gate_a_label)
+
+        layout.addRow(f"Gate {gate_index + 1}A:", gate_a_layout)
+
+        # Gate B slider
+        gate_b_slider = QSlider(Qt.Horizontal)
+        gate_b_slider.setMinimum(gate_set["gate_a_pos"])
+        gate_b_slider.setMaximum(self.trim_end)
+        gate_b_slider.setValue(gate_set["gate_b_pos"])
+        gate_b_slider.valueChanged.connect(
+            lambda value: self.on_gate_b_changed(gate_index, value)
+        )
+
+        gate_b_label = QLabel(f"{gate_set['gate_b_pos']} s")
+        gate_b_layout = QHBoxLayout()
+        gate_b_layout.addWidget(gate_b_slider)
+        gate_b_layout.addWidget(gate_b_label)
+
+        layout.addRow(f"Gate {gate_index + 1}B:", gate_b_layout)
+
+        group.setLayout(layout)
+
+        # Store the sliders and labels for later access
+        group.gate_a_slider = gate_a_slider
+        group.gate_a_label = gate_a_label
+        group.gate_b_slider = gate_b_slider
+        group.gate_b_label = gate_b_label
+
+        return group
+
+    def update_gate_controls(self):
+        """Update all gate controls' states and values"""
+        # First, ensure we have the right number of controls
+        while len(self.gate_controls) < len(self.gate_sets):
+            # Add new control
+            index = len(self.gate_controls)
+            gate_control = self.create_gate_control_group(index)
+            self.gate_controls.append(gate_control)
+
+            # Add to the layout, before the "Add Gate Set" button
+            layout = self.add_gate_button.parentWidget().layout()
+            layout.insertWidget(
+                layout.count() - 2, gate_control
+            )  # Insert before the add button and stretch
+
+        # Update minimums, maximums, and values
+        for i, gate_control in enumerate(self.gate_controls):
+            gate_set = self.gate_sets[i]
+
+            # Update Gate A slider
+            min_a = self.trim_start
+            if i > 0:
+                # A cannot be before previous B
+                min_a = max(min_a, self.gate_sets[i - 1]["gate_b_pos"])
+
+            gate_control.gate_a_slider.setMinimum(min_a)
+            gate_control.gate_a_slider.setMaximum(self.trim_end - 1)  # Leave room for B
+            gate_control.gate_a_slider.setValue(gate_set["gate_a_pos"])
+            gate_control.gate_a_label.setText(f"{gate_set['gate_a_pos']} s")
+
+            # Update Gate B slider
+            gate_control.gate_b_slider.setMinimum(
+                gate_set["gate_a_pos"] + 1
+            )  # B must be after A
+            gate_control.gate_b_slider.setMaximum(self.trim_end)
+            gate_control.gate_b_slider.setValue(gate_set["gate_b_pos"])
+            gate_control.gate_b_label.setText(f"{gate_set['gate_b_pos']} s")
+
+        # Update the add gate button state
+        self.update_add_gate_button()
+
+    def remove_last_gate_set(self):
+        """Remove the last gate set if there are more than one"""
+        if len(self.gate_sets) > 1:
+            # Remove the last gate set
+            self.gate_sets.pop()
+
+            # Update active set index to the new last set
+            self.active_set_index = len(self.gate_sets) - 1
+
+            # Remove the last control from the UI
+            if self.gate_controls:
+                last_control = self.gate_controls.pop()
+                last_control.setParent(None)  # Remove from layout
+                last_control.deleteLater()  # Schedule for deletion
+
+            # Update the UI controls
+            self.update_remove_gate_button()
+
+            # Re-detect sections with the updated gate sets
+            self.async_update()
+
+            self.map_widget.set_gate_sets(self.gate_sets, self.detected_sections)
+            self.map_widget.update()
+
+            return True
+        return False
+
+    def update_remove_gate_button(self):
+        """Update the enabled state of the remove gate button"""
+        # Enable only if there's more than one gate set
+        self.remove_gate_button.setEnabled(len(self.gate_sets) > 1)
+
+    def update_add_gate_button(self):
+        """Update the enabled state of the add gate button"""
+        # Enable only if there's room for another gate set
+        if not self.gate_sets:
+            self.add_gate_button.setEnabled(True)
+            return
+
+        last_gate_b = self.gate_sets[-1]["gate_b_pos"]
+        remaining_range = self.trim_end - last_gate_b
+
+        # Need at least 30 seconds for a new gate set
+        self.add_gate_button.setEnabled(remaining_range >= 30)
+
+        # Also update the remove button
+        self.update_remove_gate_button()
+
+    def on_add_gate_set(self):
+        """Handle adding a new gate set"""
+        if self.add_gate_set():
+            self.update_gate_controls()
+            self.async_update()
+            self.map_widget.set_gate_sets(self.gate_sets, self.detected_sections)
+            self.map_widget.update()
+
+    def update_config_text(self):
+        """Update the configuration text display"""
+        lap_str = ", ".join(map(str, self.selected_laps))
+        distance_str = f"{self.total_distance:.2f} km"
+        duration_str = f"{self.total_duration:.0f} s"
+        power_str = f"{self.avg_power:.0f} W"
+        # Convert speed from m/s to km/h for display
+        speed_str = f"{self.avg_speed:.2f} km/h"
+
+        config_text = f"Selected Laps: {lap_str}\n"
+        config_text += f"Distance: {distance_str}\n"
+        config_text += f"Duration: {duration_str}\n"
+        config_text += f"Avg Power: {power_str}\n"
+        config_text += f"Avg Speed: {speed_str}\n"
+        config_text += f"System Mass: {self.params.get('system_mass', 90)} kg\n"
+        config_text += f"Rho (air density): {self.params.get('rho', 1.2)} kg/m³\n"
+        config_text += f"Eta (drivetrain eff.): {self.params.get('eta', 0.98)}\n"
+        config_text += f"Current CdA: {self.current_cda:.3f}\n"
+        config_text += f"Current Crr: {self.current_crr:.4f}\n"
+
+        if self.params.get("wind_speed") not in [None, 0]:
+            config_text += f"Wind Speed: {self.params.get('wind_speed')} m/s\n"
+
+        if self.params.get("wind_direction") is not None:
+            config_text += f"Wind Direction: {self.params.get('wind_direction')}°"
+
+        self.config_text.setText(config_text)
+
+    def update_section_table(self):
+        """Update the section table with detected sections"""
+        self.section_table.setRowCount(len(self.detected_sections))
+
+        for row, section in enumerate(self.detected_sections):
+            # Checkbox for selection
+            checkbox = QCheckBox()
+            checkbox.setChecked(True)  # All sections selected by default
+            checkbox.stateChanged.connect(lambda: self.async_update(detect_sections=False))
+            self.section_table.setCellWidget(row, 0, checkbox)
+
+            # Section number
+            self.section_table.setItem(
+                row, 1, QTableWidgetItem(str(section["section_id"]))
+            )
+
+            # Gate set
+            self.section_table.setItem(
+                row, 2, QTableWidgetItem(f"Gate {section['gate_set']+1}")
+            )
+
+            # Duration
+            duration_mins = int(section["duration"] // 60)
+            duration_secs = int(section["duration"] % 60)
+            self.section_table.setItem(
+                row, 3, QTableWidgetItem(f"{duration_mins:02d}:{duration_secs:02d}")
+            )
+
+            # Distance
+            self.section_table.setItem(
+                row, 4, QTableWidgetItem(f"{section['distance']:.2f} km")
+            )
+
+            # Make cells read-only
+            for col in range(1, 5):
+                item = self.section_table.item(row, col)
+                if item:
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+
+        # Resize columns to fit content
+        header = self.section_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        for i in range(1, 5):
+            header.setSectionResizeMode(i, QHeaderView.Stretch)
+
+        self.selected_section_indices = self.get_selected_section_indices()
+        # Chicken-Egg situation here, selected_lap_indices can be found after a
+        # background calculation and UI query
+        if not hasattr(self, "_triggered_section_update") and self.selected_section_indices:
+            self._triggered_section_update = True
+            self.async_update()
+
+    def get_selected_section_indices(self):
+        """Get indices of selected sections in the table"""
+        selected_indices = []
+
+        for row in range(self.section_table.rowCount()):
+            checkbox = self.section_table.cellWidget(row, 0)
+            if checkbox and checkbox.isChecked():
+                selected_indices.append(row)
+
+        return selected_indices
 
     def on_gate_a_changed(self, gate_index, value):
         """Handle Gate A slider value change"""
@@ -1410,7 +1412,7 @@ class GPSGateResult(QMainWindow):
                     self.gate_controls[i].gate_b_slider.setValue(next_b_pos)
                     self.gate_controls[i].gate_b_label.setText(f"{next_b_pos} s")
 
-        self.async_update(True)
+        self.async_update()
 
         # Update map
         self.map_widget.set_gate_sets(self.gate_sets, self.detected_sections)
@@ -1443,7 +1445,7 @@ class GPSGateResult(QMainWindow):
                     self.gate_controls[i].gate_b_slider.setValue(next_b_pos)
                     self.gate_controls[i].gate_b_label.setText(f"{next_b_pos} s")
 
-        self.async_update(True)
+        self.async_update()
 
         # Update map
         self.map_widget.set_gate_sets(self.gate_sets, self.detected_sections)
@@ -1473,7 +1475,7 @@ class GPSGateResult(QMainWindow):
                     gate_control.gate_b_slider.setValue(value + 1)
                     gate_control.gate_b_label.setText(f"{value + 1} s")
 
-        self.async_update(True)
+        self.async_update()
 
         # Update map to show trim points
         self.map_widget.set_trim_start(self.trim_start)
@@ -1505,7 +1507,7 @@ class GPSGateResult(QMainWindow):
                     gate_control.gate_a_label.setText(f"{value - 1} s")
 
         # Recalculate VE metrics and update plots
-        self.async_update(True)
+        self.async_update()
 
         # Update map to show trim points
         self.map_widget.set_trim_end(self.trim_end)
@@ -1517,7 +1519,7 @@ class GPSGateResult(QMainWindow):
         self.current_cda = value / 1000.0
         self.cda_label.setText(f"{self.current_cda:.3f}")
 
-        self.async_update(False)
+        self.async_update(detect_sections=False)
         self.update_config_text()
 
     def on_crr_changed(self, value):
@@ -1526,7 +1528,7 @@ class GPSGateResult(QMainWindow):
         self.crr_label.setText(f"{self.current_crr:.4f}")
 
         # Recalculate VE and update plots
-        self.async_update(False)
+        self.async_update(detect_sections=False)
         self.update_config_text()
 
     def make_json_serializable(self, obj):
@@ -1570,7 +1572,7 @@ class GPSGateResult(QMainWindow):
         lap_str = "_".join(map(str, sorted(self.selected_laps)))
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
-        selected_section_indices = self.get_selected_section_indices()
+        selected_section_indices = self.selected_section_indices
 
         # Calculate total error for selected sections
         total_error = 0
@@ -1683,7 +1685,7 @@ class GPSGateResult(QMainWindow):
         plot_filename = f"{file_basename}_gps_gate_laps_{lap_str}_{config_name}.png"
         plot_path = os.path.join(plot_dir, plot_filename)
 
-        self.fig_canvas.fig.savefig(plot_path, dpi=300, bbox_inches="tight")
+        self.ve_plot_saver.save(self.ve_worker.get_values(), plot_path)
 
         # Save trim and gate positions to file settings
         file_settings = self.settings.get_file_settings(self.fit_file.filename)
@@ -1725,11 +1727,18 @@ class GPSGateResult(QMainWindow):
         self.parent.show()
         self.close()
 
-    def async_update(self, detect_sections):
+    def on_plot_size_changed(self):
+        self.plot_size_info = self.ve_plot.get_size_info()
+        self.async_update(update_ve=False, detect_sections=False)
+
+    def async_update(self, update_ve=True, detect_sections=True):
+        self.selected_section_indices = self.get_selected_section_indices()
+
         values = {}
         for key in VEWorker.INPUT_KEYS:
             values[key] = getattr(self, key)
         values["detect_sections"] = detect_sections and self.has_gps and self.gate_sets
+        values["update_ve"] = update_ve
 
         self.ve_worker.set_values(values)
 
@@ -1744,7 +1753,8 @@ class GPSGateResult(QMainWindow):
             # Update control min/max values
             self.update_gate_controls()
 
-        self.update_plots()
+        self.ve_plot.set_fig(self.fig_res)
+        self.fig_res = None
 
     def join_threads(self):
         if self.map_widget:
