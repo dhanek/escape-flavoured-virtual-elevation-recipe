@@ -12,44 +12,50 @@ class CancelledError(Exception):
     pass
 
 class AltitudeLookup:
+    TILE_SIZE = 512
+
     def __init__(self, dem_path):
         self.dataset = rasterio.open(dem_path)
-
-    def read(self, check_canceled=lambda: None):
         self.transformer = Transformer.from_crs("EPSG:4326", self.dataset.crs, always_xy=True)
-        tile_size = 512
-        width, height = self.dataset.width, self.dataset.height
-        # preallocate
-        self.band = np.zeros((height, width), dtype=self.dataset.dtypes[0])
 
-        # read in small tiles in order to check for cancelation
-        for y in range(0, height, tile_size):
-            for x in range(0, width, tile_size):
-                win_width = min(tile_size, width - x)
-                win_height = min(tile_size, height - y)
-                window = Window(x, y, win_width, win_height)
+    def batch_lookup(self, lats, lons):
+        # Transform all coordinates
+        xs, ys = self.transformer.transform(lons, lats)
 
+        # Find which cell (row, col) in the raster matches each point
+        index_func = np.vectorize(self.dataset.index)
+        rows, cols = index_func(xs, ys)
+
+        # Create dataframe for easier grouping
+        df = pd.DataFrame({
+            "lat": lats,
+            "lon": lons,
+            "row": rows,
+            "col": cols,
+        })
+
+        # Assign tile group
+        df["tile_row"] = df["row"] // self.TILE_SIZE
+        df["tile_col"] = df["col"] // self.TILE_SIZE
+
+        altitudes = np.full(len(df), np.nan)
+
+        for (tile_r, tile_c), group in df.groupby(["tile_row", "tile_col"]):
+            window = Window(tile_c * self.TILE_SIZE, tile_r * self.TILE_SIZE, self.TILE_SIZE, self.TILE_SIZE)
+            try:
                 tile = self.dataset.read(1, window=window)
-                self.band[y:y+win_height, x:x+win_width] = tile
+            except Exception as e:
+                print(f"Tile read error: {e}")
+                continue
 
-                check_canceled()
+            for idx, row in group.iterrows():
+                local_r = int(row["row"] - tile_r * self.TILE_SIZE)
+                local_c = int(row["col"] - tile_c * self.TILE_SIZE)
 
-    def get_altitude(self, lat, lon):
-        try:
-            x, y = self.transformer.transform(lon, lat)
-            row, col = self.dataset.index(x, y)
+                if (0 <= local_r < tile.shape[0]) and (0 <= local_c < tile.shape[1]):
+                    altitudes[idx] = tile[local_r, local_c]
 
-            if (
-                0 <= row < self.band.shape[0]
-                and 0 <= col < self.band.shape[1]
-            ):
-                return float(self.band[row, col])
-            else:
-                return None
-
-        except Exception as e:
-            print(f"Error at ({lat}, {lon}): {e}")
-            return None
+        return altitudes
 
     def close(self):
         self.dataset.close()
@@ -72,9 +78,6 @@ class FitFile:
         self.cancel_event = threading.Event()
 
     def parse(self):
-        if self.elevation:
-            self.elevation.read(self.check_canceled)
-
         self.parse_data()
         self.resample_data()
 
@@ -218,16 +221,22 @@ class FitFile:
                 self.records_df["position_long"] = self.records_df["position_long"] * (
                     180 / 2**31
                 )
+
                 if self.elevation:
-                    def try_get_altitude(row):
-                        alt = self.elevation.get_altitude(row["position_lat"],
-                                                          row["position_long"])
-                        if alt is None:
-                            self.elevation_error_count += 1
-                            return row["altitude"]
-                        return alt
-                    self.records_df["altitude"] = self.records_df.apply(try_get_altitude, axis=1)
-                self.elevation_error_rate = self.elevation_error_count / self.records_df["altitude"].count()
+                    lat_col = self.records_df["position_lat"].values
+                    lon_col = self.records_df["position_long"].values
+
+                    self.check_canceled()
+
+                    alts = self.elevation.batch_lookup(lat_col, lon_col)
+
+                    # Fallback to original alt if DEM fails
+                    alt_col = self.records_df["altitude"].values
+                    invalid_alt_mask = np.isnan(alts)
+                    corrected_alt = np.where(invalid_alt_mask, alt_col, alts)
+
+                    self.records_df["altitude"] = corrected_alt
+                    self.elevation_error_rate = invalid_alt_mask.sum() / len(alts)
 
         self.check_canceled()
 

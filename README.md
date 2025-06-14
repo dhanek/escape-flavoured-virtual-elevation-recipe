@@ -102,6 +102,13 @@ For France:
 
 Use this mosaic_l93.vrt file from the "Correct Elevation" dialog.
 
+For USA:
+ - Go to https://apps.nationalmap.gov/downloader/
+ - Select "Elevation Products (3D Elevation Program Products and Services)"
+ - Search your area (Right corner)
+ - Download the tiff files that cover your area (prioritize 1 meter DEM)
+ - In the VE application, select one .tiff file (cf. gdalbuildvrt above if your ride is across several tiff files)
+
 ### Parameters
 - **CdA**: Coefficient of drag × frontal area (m²)
 - **Crr**: Coefficient of rolling resistance
