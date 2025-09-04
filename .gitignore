@@ -175,3 +175,4 @@ CLAUDE.md
 .claude/settings.local.json
 .python-version
 uv.lock
+wahoo_ace.fit

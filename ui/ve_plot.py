@@ -16,6 +16,7 @@ class VEPlotLabel(QLabel):
         self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.updateGeometry()
         self.screen = screen
+        self.pixel_ratio = screen.devicePixelRatio()
         self.setMinimumSize(self.size())
         self.screen.logicalDotsPerInchChanged.connect(self.on_dpi_changed)
 
@@ -24,6 +25,7 @@ class VEPlotLabel(QLabel):
         self.sizeChanged.emit()
 
     def on_dpi_changed(self, dpi):
+        self.pixel_ratio = self.screen.devicePixelRatio()
         self.sizeChanged.emit()
 
     def get_size_info(self):

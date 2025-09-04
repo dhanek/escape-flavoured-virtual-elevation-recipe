@@ -15,7 +15,9 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QRadioButton,
     QSplitter,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -47,6 +49,18 @@ class VEWorker(AsyncWorker):
         "virtual_elevation_calibrated",
         "virtual_elevation",
         "fig_res",
+        # Comparison mode results
+        "virtual_elevation_constant_wind",
+        "virtual_elevation_fit_wind",
+        "virtual_elevation_calibrated_constant_wind",
+        "virtual_elevation_calibrated_fit_wind",
+        "r2_constant_wind",
+        "r2_fit_wind",
+        "rmse_constant_wind",
+        "rmse_fit_wind",
+        "is_comparison_mode",
+        # Wind speed plot data
+        "wind_plot_fig",
     ]
 
     def __init__(self, merged_data, params):
@@ -57,11 +71,11 @@ class VEWorker(AsyncWorker):
         self.ve_calculator = VirtualElevation(self.merged_data, params)
         self.ve_valid = False
 
-    def _process_value(self, values: dict):
+    def _process_value(self, value: dict):
         for key in VEWorker.INPUT_KEYS:
-            setattr(self, key, values[key])
+            setattr(self, key, value[key])
 
-        if values["update_ve"] or not self.ve_valid:
+        if value["update_ve"] or not self.ve_valid:
             self.calculate_ve()
             self.prepare_plots()
             self.ve_valid = True
@@ -72,6 +86,18 @@ class VEWorker(AsyncWorker):
 
         self.update_plots()
 
+        # Generate wind plot if wind analysis is available (constant wind or FIT wind)
+        has_constant_wind = (
+            self.params.get("wind_speed")
+            and self.params.get("wind_direction") is not None
+        )
+        has_fit_wind = self.params.get("fit_wind_speed") is not None
+
+        if has_constant_wind or has_fit_wind:
+            self.create_wind_plot()
+        else:
+            self.wind_plot_fig = None
+
         for key in VEWorker.RESULT_KEYS:
             out_values[key] = getattr(self, key)
 
@@ -79,6 +105,9 @@ class VEWorker(AsyncWorker):
 
     def calculate_ve(self):
         """Calculate virtual elevation with current parameters"""
+        # Check if we're in comparison mode
+        self.is_comparison_mode = self.params.get("comparison_mode", False)
+
         # Extract actual elevation if available
         self.actual_elevation = None
         if (
@@ -90,16 +119,92 @@ class VEWorker(AsyncWorker):
         if self.params["velodrome"] and self.actual_elevation is not None:
             self.actual_elevation = np.zeros_like(self.actual_elevation)
 
+        if self.is_comparison_mode:
+            # Calculate both constant wind and FIT wind profiles
+            self._calculate_comparison_ve()
+        else:
+            # Calculate single virtual elevation profile
+            self._calculate_single_ve()
+
+    def _calculate_single_ve(self):
+        """Calculate single virtual elevation profile"""
         # Calculate virtual elevation
         self.virtual_elevation = self.ve_calculator.calculate_ve(
             self.current_cda, self.current_crr
         )
 
-        # Calculate metrics
+        # Set comparison mode results to None
+        self.virtual_elevation_constant_wind = None
+        self.virtual_elevation_fit_wind = None
+        self.virtual_elevation_calibrated_constant_wind = None
+        self.virtual_elevation_calibrated_fit_wind = None
+        self.r2_constant_wind = None
+        self.r2_fit_wind = None
+        self.rmse_constant_wind = None
+        self.rmse_fit_wind = None
+
+        self._calculate_metrics_and_calibration(
+            self.virtual_elevation,
+            "r2",
+            "rmse",
+            "ve_elevation_diff",
+            "virtual_elevation_calibrated",
+        )
+
+    def _calculate_comparison_ve(self):
+        """Calculate both constant wind and FIT wind virtual elevation profiles"""
+        from models.virtual_elevation import VirtualElevation
+
+        # Create parameters for constant wind (no fit_wind_speed)
+        constant_wind_params = self.params.copy()
+        if "fit_wind_speed" in constant_wind_params:
+            del constant_wind_params["fit_wind_speed"]
+
+        # Create VE calculator for constant wind
+        ve_calc_constant = VirtualElevation(self.merged_data, constant_wind_params)
+        self.virtual_elevation_constant_wind = ve_calc_constant.calculate_ve(
+            self.current_cda, self.current_crr
+        )
+
+        # Use existing calculator for FIT wind (already has fit_wind_speed)
+        self.virtual_elevation_fit_wind = self.ve_calculator.calculate_ve(
+            self.current_cda, self.current_crr
+        )
+
+        # For primary results, use FIT wind results
+        self.virtual_elevation = self.virtual_elevation_fit_wind
+
+        # Calculate metrics for both
+        self._calculate_metrics_and_calibration(
+            self.virtual_elevation_constant_wind,
+            "r2_constant_wind",
+            "rmse_constant_wind",
+            "ve_elevation_diff_constant_wind",
+            "virtual_elevation_calibrated_constant_wind",
+        )
+
+        self._calculate_metrics_and_calibration(
+            self.virtual_elevation_fit_wind,
+            "r2_fit_wind",
+            "rmse_fit_wind",
+            "ve_elevation_diff_fit_wind",
+            "virtual_elevation_calibrated_fit_wind",
+        )
+
+        # Set primary results to FIT wind results
+        self.r2 = self.r2_fit_wind
+        self.rmse = self.rmse_fit_wind
+        self.ve_elevation_diff = self.ve_elevation_diff_fit_wind
+        self.virtual_elevation_calibrated = self.virtual_elevation_calibrated_fit_wind
+
+    def _calculate_metrics_and_calibration(
+        self, ve_data, r2_attr, rmse_attr, diff_attr, calibrated_attr
+    ):
+        """Calculate metrics and calibration for a virtual elevation profile"""
         if self.actual_elevation is not None:
             # Ensure same length
-            min_len = min(len(self.virtual_elevation), len(self.actual_elevation))
-            ve_trim = self.virtual_elevation[:min_len]
+            min_len = min(len(ve_data), len(self.actual_elevation))
+            ve_trim = ve_data[:min_len]
             elev_trim = self.actual_elevation[:min_len]
 
             # Calibrate to match at trim start
@@ -108,9 +213,9 @@ class VEWorker(AsyncWorker):
                 # Calculate offset to make virtual elevation match actual at trim start
                 offset = elev_trim[trim_start_idx] - ve_trim[trim_start_idx]
                 ve_calibrated = ve_trim + offset
-                self.virtual_elevation_calibrated = ve_calibrated
+                setattr(self, calibrated_attr, ve_calibrated)
             else:
-                self.virtual_elevation_calibrated = ve_trim
+                setattr(self, calibrated_attr, ve_trim)
 
             # Calculate metrics in trimmed region
             trim_indices = np.where(
@@ -119,48 +224,52 @@ class VEWorker(AsyncWorker):
             )[0]
 
             if len(trim_indices) > 2:  # Need at least 3 points for correlation
-                ve_trim_region = self.virtual_elevation_calibrated[trim_indices]
+                ve_trim_region = getattr(self, calibrated_attr)[trim_indices]
                 elev_trim_region = elev_trim[trim_indices]
 
                 # R² calculation
-                # Handle case where elevation is constant (velodrome mode)
                 if np.std(elev_trim_region) == 0 or np.std(ve_trim_region) == 0:
-                    self.r2 = 0.0  # No correlation possible with constant data
+                    setattr(self, r2_attr, 0.0)
                 else:
                     corr = np.corrcoef(ve_trim_region, elev_trim_region)[0, 1]
-                    self.r2 = corr**2
+                    setattr(self, r2_attr, corr**2)
 
                 # RMSE calculation
-                self.rmse = np.sqrt(np.mean((ve_trim_region - elev_trim_region) ** 2))
+                setattr(
+                    self,
+                    rmse_attr,
+                    np.sqrt(np.mean((ve_trim_region - elev_trim_region) ** 2)),
+                )
 
-                # Calculate elevation gain (difference between end and start)
-                # Make sure we don't exceed array bounds
+                # Calculate elevation difference
                 safe_trim_end = min(self.trim_end, len(ve_trim) - 1)
                 safe_trim_start = min(self.trim_start, safe_trim_end)
 
-                # Elevation differences
-                self.ve_elevation_diff = (
-                    ve_calibrated[safe_trim_end] - ve_calibrated[safe_trim_start]
+                ve_calibrated = getattr(self, calibrated_attr)
+                setattr(
+                    self,
+                    diff_attr,
+                    ve_calibrated[safe_trim_end] - ve_calibrated[safe_trim_start],
                 )
-                self.actual_elevation_diff = (
-                    elev_trim[safe_trim_end] - elev_trim[safe_trim_start]
-                )
+
+                if not hasattr(self, "actual_elevation_diff"):
+                    self.actual_elevation_diff = (
+                        elev_trim[safe_trim_end] - elev_trim[safe_trim_start]
+                    )
             else:
-                self.r2 = 0
-                self.rmse = 0
-                self.ve_elevation_diff = 0
-                self.actual_elevation_diff = 0
+                setattr(self, r2_attr, 0)
+                setattr(self, rmse_attr, 0)
+                setattr(self, diff_attr, 0)
+                if not hasattr(self, "actual_elevation_diff"):
+                    self.actual_elevation_diff = 0
         else:
             # If no actual elevation data, still create a calibrated version
-            self.virtual_elevation_calibrated = self.virtual_elevation.copy()
-            self.ve_elevation_diff = (
-                self.virtual_elevation_calibrated[
-                    min(self.trim_end, len(self.virtual_elevation_calibrated) - 1)
-                ]
-                - self.virtual_elevation_calibrated[
-                    min(self.trim_start, len(self.virtual_elevation_calibrated) - 1)
-                ]
-            )
+            setattr(self, calibrated_attr, ve_data.copy())
+            safe_trim_end = min(self.trim_end, len(ve_data) - 1)
+            safe_trim_start = min(self.trim_start, safe_trim_end)
+            setattr(self, diff_attr, ve_data[safe_trim_end] - ve_data[safe_trim_start])
+            setattr(self, r2_attr, 0)
+            setattr(self, rmse_attr, 0)
 
     def prepare_plots(self):
         # Use recorded distance from FIT file (convert to km) and reset to start from 0
@@ -189,35 +298,92 @@ class VEWorker(AsyncWorker):
         fig, ax1, ax2 = ve_fig.get_fig_axes()
 
         distance = self.distance
-
-        # Plot virtual elevation with FULL OPACITY in trimmed region, REDUCED OPACITY elsewhere
-        # First plot full curve with reduced opacity
-        ax1.plot(
-            distance,
-            self.virtual_elevation_calibrated,
-            color="blue",
-            alpha=0.3,
-            linewidth=3,
-            label="_nolegend_",
-        )
-
-        # Then plot just the trimmed region with full opacity
-        # Special handling for edge cases when trim_start=0 or trim_end=max
         trim_start = self.trim_start
-        trim_end = min(self.trim_end, len(self.virtual_elevation_calibrated) - 1)
 
-        # Ensure we have a valid range
-        if trim_start <= trim_end:
-            trim_distance = distance[trim_start : trim_end + 1]
-            trim_ve = self.virtual_elevation_calibrated[trim_start : trim_end + 1]
-            ax1.plot(
-                trim_distance,
-                trim_ve,
-                color="blue",
-                alpha=1.0,
-                linewidth=4,
-                label="Virtual Elevation",
+        if (
+            self.is_comparison_mode
+            and hasattr(self, "virtual_elevation_calibrated_constant_wind")
+            and hasattr(self, "virtual_elevation_calibrated_fit_wind")
+        ):
+            # Comparison mode: plot both constant wind and FIT wind profiles
+            trim_end = min(
+                self.trim_end,
+                len(self.virtual_elevation_calibrated_constant_wind) - 1,
+                len(self.virtual_elevation_calibrated_fit_wind) - 1,
             )
+
+            # Plot constant wind profile
+            ax1.plot(
+                distance,
+                self.virtual_elevation_calibrated_constant_wind,
+                color="#000000",
+                alpha=0.3,
+                linewidth=3,
+                label="_nolegend_",
+            )
+            if trim_start <= trim_end:
+                trim_distance = distance[trim_start : trim_end + 1]
+                trim_ve_constant = self.virtual_elevation_calibrated_constant_wind[
+                    trim_start : trim_end + 1
+                ]
+                ax1.plot(
+                    trim_distance,
+                    trim_ve_constant,
+                    color="#000000",
+                    alpha=1.0,
+                    linewidth=4,
+                    label="VE (Constant Wind)",
+                )
+
+            # Plot FIT wind profile
+            ax1.plot(
+                distance,
+                self.virtual_elevation_calibrated_fit_wind,
+                color="#4363d8",
+                alpha=0.3,
+                linewidth=3,
+                label="_nolegend_",
+            )
+            if trim_start <= trim_end:
+                trim_distance = distance[trim_start : trim_end + 1]
+                trim_ve_fit = self.virtual_elevation_calibrated_fit_wind[
+                    trim_start : trim_end + 1
+                ]
+                ax1.plot(
+                    trim_distance,
+                    trim_ve_fit,
+                    color="#4363d8",
+                    alpha=1.0,
+                    linewidth=4,
+                    label="VE (FIT Wind)",
+                )
+
+        else:
+            # Single profile mode: plot virtual elevation with FULL OPACITY in trimmed region, REDUCED OPACITY elsewhere
+            trim_end = min(self.trim_end, len(self.virtual_elevation_calibrated) - 1)
+
+            # First plot full curve with reduced opacity
+            ax1.plot(
+                distance,
+                self.virtual_elevation_calibrated,
+                color="#4363d8",
+                alpha=0.3,
+                linewidth=3,
+                label="_nolegend_",
+            )
+
+            # Then plot just the trimmed region with full opacity
+            if trim_start <= trim_end:
+                trim_distance = distance[trim_start : trim_end + 1]
+                trim_ve = self.virtual_elevation_calibrated[trim_start : trim_end + 1]
+                ax1.plot(
+                    trim_distance,
+                    trim_ve,
+                    color="#4363d8",
+                    alpha=1.0,
+                    linewidth=4,
+                    label="Virtual Elevation",
+                )
 
         # Mark trimmed region with higher opacity - use lower opacity (0.1) for excluded regions
         if len(distance) > 0:
@@ -300,14 +466,18 @@ class VEWorker(AsyncWorker):
             residuals = ve_trim - elev_trim
 
             # First plot full residuals with reduced opacity
-            ax2.plot(distance_trim, residuals, color="gray", alpha=0.3, linewidth=3)
+            ax2.plot(distance_trim, residuals, color="#a9a9a9", alpha=0.3, linewidth=3)
 
             # Then plot just the trimmed region with full opacity
             if trim_start <= trim_end_safe:
                 trim_distance = distance_trim[trim_start : trim_end_safe + 1]
                 trim_residuals = residuals[trim_start : trim_end_safe + 1]
                 ax2.plot(
-                    trim_distance, trim_residuals, color="gray", alpha=1.0, linewidth=4
+                    trim_distance,
+                    trim_residuals,
+                    color="#a9a9a9",
+                    alpha=1.0,
+                    linewidth=4,
                 )
 
             ax2.axhline(y=0, color="black", linestyle="-")
@@ -398,6 +568,160 @@ class VEWorker(AsyncWorker):
 
         self.fig_res = ve_fig.draw()
 
+    def create_wind_plot(self):
+        """Create wind speed analysis plot using EXACT same logic as VE plot"""
+        import numpy as np
+
+        # EXACT same VEFigure creation as update_plots
+        ve_fig = VEFigure(self.plot_size_info)
+        fig, ax1, ax2 = ve_fig.get_fig_axes()
+
+        distance = self.distance
+        trim_start = self.trim_start
+        trim_end = min(self.trim_end, len(distance) - 1)
+
+        # Prepare wind speed data
+        ground_speed = self.merged_data["speed"].values * 3.6  # Convert m/s to km/h
+
+        # Constant wind apparent speed
+        if (
+            self.params.get("wind_speed")
+            and self.params.get("wind_direction") is not None
+        ):
+            from models.virtual_elevation import VirtualElevation
+
+            ve_temp = VirtualElevation(self.merged_data, self.params)
+            effective_wind = ve_temp.calculate_effective_wind() * 3.6
+            ground_plus_constant = ground_speed - effective_wind
+        else:
+            ground_plus_constant = ground_speed
+
+        # FIT wind apparent speed
+        fit_wind_data = self.params.get("fit_wind_speed")
+        if fit_wind_data is not None:
+            min_len = min(len(ground_speed), len(fit_wind_data))
+            fit_wind_kmh = np.nan_to_num(fit_wind_data[:min_len] * 3.6, nan=0.0)
+            ground_plus_fit = ground_speed[:min_len] - fit_wind_kmh
+        else:
+            ground_plus_fit = ground_speed
+
+        # EXACT same plotting pattern as VE plot - full curves with reduced opacity
+        ax1.plot(
+            distance,
+            ground_speed,
+            color="#a9a9a9",
+            alpha=0.3,
+            linewidth=3,
+            label="_nolegend_",
+        )
+        ax1.plot(
+            distance,
+            ground_plus_constant,
+            color="#000000",
+            alpha=0.3,
+            linewidth=3,
+            label="_nolegend_",
+        )
+
+        # Only plot FIT wind if available
+        if fit_wind_data is not None:
+            min_len = min(len(distance), len(ground_plus_fit))
+            ax1.plot(
+                distance[:min_len],
+                ground_plus_fit[:min_len],
+                color="#4363d8",
+                alpha=0.3,
+                linewidth=3,
+                label="_nolegend_",
+            )
+
+        # Trimmed regions with full opacity - EXACT same as VE plot
+        if trim_start <= trim_end:
+            trim_distance = distance[trim_start : trim_end + 1]
+            trim_ground = ground_speed[trim_start : trim_end + 1]
+            trim_constant = ground_plus_constant[trim_start : trim_end + 1]
+
+            # Only plot FIT wind trimmed region if FIT wind data is available
+            if fit_wind_data is not None:
+                fit_trim_len = min(
+                    len(trim_distance), len(ground_plus_fit) - trim_start
+                )
+                if fit_trim_len > 0:
+                    trim_fit = ground_plus_fit[trim_start : trim_start + fit_trim_len]
+                    ax1.plot(
+                        trim_distance[:fit_trim_len],
+                        trim_fit,
+                        color="#4363d8",
+                        alpha=1.0,
+                        linewidth=4,
+                        label="Apparent (FIT Wind)",
+                    )
+
+            ax1.plot(
+                trim_distance,
+                trim_ground,
+                color="#a9a9a9",
+                alpha=1.0,
+                linewidth=4,
+                label="Ground Speed",
+            )
+            ax1.plot(
+                trim_distance,
+                trim_constant,
+                color="#000000",
+                alpha=1.0,
+                linewidth=4,
+                label="Apparent (Constant Wind)",
+            )
+
+        # Mark trimmed region - EXACT same as VE plot
+        if len(distance) > 0:
+            ax1.axvspan(
+                0,
+                distance[self.trim_start] if self.trim_start < len(distance) else 0,
+                alpha=0.1,
+                color="gray",
+            )
+            ax1.axvspan(
+                (
+                    distance[self.trim_end]
+                    if self.trim_end < len(distance)
+                    else distance[-1]
+                ),
+                distance[-1],
+                alpha=0.1,
+                color="gray",
+            )
+
+        # Vertical lines - EXACT same as VE plot
+        if self.trim_start < len(distance):
+            ax1.axvline(
+                x=distance[self.trim_start],
+                color="green",
+                linestyle="--",
+                label="_nolegend_",
+            )
+        if self.trim_end < len(distance):
+            ax1.axvline(
+                x=distance[self.trim_end],
+                color="red",
+                linestyle="--",
+                label="_nolegend_",
+            )
+
+        # Formatting
+        ax1.set_xlabel("Distance (km)")
+        ax1.set_ylabel("Speed (km/h)")
+        ax1.set_title("Wind Speed Analysis")
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+
+        # Hide second subplot
+        ax2.set_visible(False)
+
+        # EXACT same draw method as VE plot
+        self.wind_plot_fig = ve_fig.draw()
+
 
 class AnalysisResult(QMainWindow):
     """Window for displaying virtual elevation analysis results"""
@@ -414,16 +738,6 @@ class AnalysisResult(QMainWindow):
         # Prepare merged lap data
         self.prepare_merged_data()
 
-        self.ve_worker = VEWorker(self.merged_data, self.params)
-        self.ve_thread = QThread()
-        self.ve_worker.moveToThread(self.ve_thread)
-        self.ve_worker.resultReady.connect(self.on_ve_result_ready)
-        self.ve_plot_saver = VEPlotSaver(
-            VEWorker(self.merged_data, self.params), self.ve_thread
-        )
-        self.ve_thread.start()
-        QApplication.instance().aboutToQuit.connect(self.join_threads)
-
         # Get lap combination ID for settings
         self.lap_combo_id = "_".join(map(str, sorted(self.selected_laps)))
 
@@ -431,6 +745,16 @@ class AnalysisResult(QMainWindow):
         file_settings = self.settings.get_file_settings(self.fit_file.filename)
         trim_settings = file_settings.get("trim_settings", {})
         saved_trim = trim_settings.get(self.lap_combo_id, {})
+
+        # Wind source settings - initialize before creating VE worker
+        self.has_fit_wind = self.fit_file.has_wind_speed_data()
+        self.wind_source = saved_trim.get(
+            "wind_source", "constant"
+        )  # "constant", "fit", "compare"
+
+        # Ensure valid wind source if no FIT wind data
+        if not self.has_fit_wind and self.wind_source in ["fit", "compare"]:
+            self.wind_source = "constant"
 
         # Initialize UI values
         if saved_trim and "trim_start" in saved_trim and "trim_end" in saved_trim:
@@ -464,6 +788,17 @@ class AnalysisResult(QMainWindow):
 
         # Setup UI
         self.initUI()
+
+        # Create VE worker after UI initialization so plot_size_info is available
+        self.ve_worker = VEWorker(self.merged_data, self.get_current_params())
+        self.ve_thread = QThread()
+        self.ve_worker.moveToThread(self.ve_thread)
+        self.ve_worker.resultReady.connect(self.on_ve_result_ready)
+        self.ve_plot_saver = VEPlotSaver(
+            VEWorker(self.merged_data, self.get_current_params()), self.ve_thread
+        )
+        self.ve_thread.start()
+        QApplication.instance().aboutToQuit.connect(self.join_threads)
 
         self.async_update()
         self.ve_plot.sizeChanged.connect(self.on_plot_size_changed)
@@ -499,7 +834,7 @@ class AnalysisResult(QMainWindow):
     def initUI(self):
         """Initialize the UI components"""
         self.setWindowTitle(
-            f'Virtual Elevation Analysis - Laps {", ".join(map(str, self.selected_laps))}'
+            f"Virtual Elevation Analysis - Laps {', '.join(map(str, self.selected_laps))}"
         )
         self.setGeometry(50, 50, 1200, 800)
 
@@ -565,15 +900,31 @@ class AnalysisResult(QMainWindow):
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
 
-        # Plot area
-        plot_widget = QWidget()
-        plot_layout = QVBoxLayout(plot_widget)
+        # Create tabbed plot area
+        self.plot_tabs = QTabWidget()
 
-        # Create plots
+        # Virtual Elevation tab
+        ve_tab = QWidget()
+        ve_layout = QVBoxLayout(ve_tab)
         self.ve_plot = VEPlotLabel(self.screen())
-        plot_layout.addWidget(self.ve_plot)
+        ve_layout.addWidget(self.ve_plot)
+        self.plot_tabs.addTab(ve_tab, "Virtual Elevation")
 
-        right_layout.addWidget(plot_widget, 3)
+        # Wind Speed Analysis tab (if FIT wind data is available OR constant wind is configured)
+        has_constant_wind = (
+            self.params.get("wind_speed")
+            and self.params.get("wind_direction") is not None
+        )
+        if self.has_fit_wind or has_constant_wind:
+            wind_tab = QWidget()
+            wind_layout = QVBoxLayout(wind_tab)
+            self.wind_plot = VEPlotLabel(self.screen())
+            wind_layout.addWidget(self.wind_plot)
+            self.plot_tabs.addTab(wind_tab, "Wind Speed Analysis")
+        else:
+            self.wind_plot = None
+
+        right_layout.addWidget(self.plot_tabs, 3)
         self.plot_size_info = self.ve_plot.get_size_info()
 
         # Sliders
@@ -585,7 +936,7 @@ class AnalysisResult(QMainWindow):
             minimum=0,
             maximum=len(self.merged_data) - 30,
             value=self.trim_start,
-            is_float=False
+            is_float=False,
         )
         self.trim_start_slider.valueChanged.connect(self.on_trim_start_changed)
 
@@ -596,7 +947,7 @@ class AnalysisResult(QMainWindow):
             minimum=30,
             maximum=len(self.merged_data),
             value=self.trim_end,
-            is_float=False
+            is_float=False,
         )
         self.trim_end_slider.valueChanged.connect(self.on_trim_end_changed)
 
@@ -608,7 +959,7 @@ class AnalysisResult(QMainWindow):
             maximum=self.params.get("cda_max", 0.5),
             value=self.current_cda,
             is_float=True,
-            decimals=3
+            decimals=3,
         )
         self.cda_slider.valueChanged.connect(self.on_cda_changed)
         self.cda_slider.set_enabled(self.params.get("cda") is None)
@@ -621,12 +972,40 @@ class AnalysisResult(QMainWindow):
             maximum=self.params.get("crr_max", 0.03),
             value=self.current_crr,
             is_float=True,
-            decimals=4
+            decimals=4,
         )
         self.crr_slider.valueChanged.connect(self.on_crr_changed)
         self.crr_slider.set_enabled(self.params.get("crr") is None)
 
         slider_layout.addRow("Crr:", self.crr_slider)
+
+        # Wind source controls (only show if FIT wind data is available)
+        if self.has_fit_wind:
+            # Wind source radio buttons
+            wind_layout = QVBoxLayout()
+
+            self.wind_constant_radio = QRadioButton("Use constant wind settings")
+            self.wind_fit_radio = QRadioButton("Use FIT file wind speed")
+            self.wind_compare_radio = QRadioButton("Compare both methods")
+
+            # Set initial selection
+            if self.wind_source == "constant":
+                self.wind_constant_radio.setChecked(True)
+            elif self.wind_source == "fit":
+                self.wind_fit_radio.setChecked(True)
+            elif self.wind_source == "compare":
+                self.wind_compare_radio.setChecked(True)
+
+            # Connect signals
+            self.wind_constant_radio.toggled.connect(self.on_wind_source_changed)
+            self.wind_fit_radio.toggled.connect(self.on_wind_source_changed)
+            self.wind_compare_radio.toggled.connect(self.on_wind_source_changed)
+
+            wind_layout.addWidget(self.wind_constant_radio)
+            wind_layout.addWidget(self.wind_fit_radio)
+            wind_layout.addWidget(self.wind_compare_radio)
+
+            slider_layout.addRow("Wind Source:", wind_layout)
 
         slider_group.setLayout(slider_layout)
         right_layout.addWidget(slider_group, 1)
@@ -713,6 +1092,67 @@ class AnalysisResult(QMainWindow):
         self.async_update()
 
         self.update_config_text()
+
+    def on_wind_source_changed(self):
+        """Handle wind source radio button changes"""
+        if (
+            hasattr(self, "wind_constant_radio")
+            and self.wind_constant_radio.isChecked()
+        ):
+            self.wind_source = "constant"
+        elif hasattr(self, "wind_fit_radio") and self.wind_fit_radio.isChecked():
+            self.wind_source = "fit"
+        elif (
+            hasattr(self, "wind_compare_radio") and self.wind_compare_radio.isChecked()
+        ):
+            self.wind_source = "compare"
+
+        # Recreate VE worker with new parameters (AsyncWorker doesn't have stop method)
+        self.ve_worker = VEWorker(self.merged_data, self.get_current_params())
+        self.ve_worker.moveToThread(self.ve_thread)
+        self.ve_worker.resultReady.connect(self.on_ve_result_ready)
+
+        self.async_update()
+        self.update_config_text()
+
+    def get_current_params(self):
+        """Get current parameters including wind data based on wind source selection"""
+        current_params = self.params.copy()
+
+        # Add FIT wind speed data if using FIT or comparison mode
+        if self.wind_source in ["fit", "compare"] and self.has_fit_wind:
+            # Get wind speed data for the selected laps
+            fit_wind_data = self.fit_file.get_wind_speed_data()
+            if fit_wind_data is not None:
+                # For now, we'll align by assuming both datasets have the same length after resampling
+                # In the future, this could be improved to align by timestamp
+                min_len = min(len(self.merged_data), len(fit_wind_data))
+                wind_for_laps = fit_wind_data[:min_len]
+                current_params["fit_wind_speed"] = wind_for_laps
+
+        # Set comparison mode flag
+        current_params["comparison_mode"] = self.wind_source == "compare"
+
+        # Always add fit_wind_speed when available (for wind plot generation)
+        if self.has_fit_wind and "fit_wind_speed" not in current_params:
+            fit_wind_data = self.fit_file.get_wind_speed_data()
+            if fit_wind_data is not None:
+                min_len = min(len(self.merged_data), len(fit_wind_data))
+                wind_for_laps = fit_wind_data[:min_len]
+                current_params["fit_wind_speed"] = wind_for_laps
+
+        # Add plot size info for high-quality rendering - always get fresh size info
+        if hasattr(self, "wind_plot") and self.wind_plot:
+            # Use wind plot's current size for wind plot rendering
+            current_params["wind_plot_size_info"] = self.wind_plot.get_size_info()
+
+        # Use VE plot size info as default
+        if hasattr(self, "plot_size_info"):
+            current_params["plot_size_info"] = (
+                self.ve_plot.get_size_info()
+            )  # Always fresh
+
+        return current_params
 
     def _fit_map_to_full_route(self, m):
         """Helper to fit map to full route bounds"""
@@ -837,6 +1277,7 @@ class AnalysisResult(QMainWindow):
             "trim_end": self.trim_end,
             "cda": self.current_cda,
             "crr": self.current_crr,
+            "wind_source": self.wind_source,
         }
 
         # Save updated file settings
@@ -872,6 +1313,15 @@ class AnalysisResult(QMainWindow):
 
         self.ve_plot.set_fig(self.fig_res)
         self.fig_res = None
+
+        # Update wind plot if it exists and we have wind plot data
+        if (
+            hasattr(self, "wind_plot")
+            and hasattr(self, "wind_plot_fig")
+            and self.wind_plot_fig
+        ):
+            self.wind_plot.set_fig(self.wind_plot_fig)
+            self.wind_plot_fig = None
 
     def join_threads(self):
         if self.map_widget:

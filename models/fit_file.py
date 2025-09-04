@@ -194,6 +194,7 @@ class FitFile:
                     "power",
                     "altitude",
                     "enhanced_altitude",  # Added enhanced_altitude
+                    "wind_speed",  # Added wind_speed
                 ]:
                     record_data[data.name] = data.value
 
@@ -203,6 +204,10 @@ class FitFile:
 
             if "enhanced_altitude" in record_data:
                 record_data["altitude"] = record_data["enhanced_altitude"]
+
+            # Convert wind_speed from m/s * 1000 to m/s
+            if "wind_speed" in record_data and record_data["wind_speed"] is not None:
+                record_data["wind_speed"] = record_data["wind_speed"] / 1000.0
 
             if "timestamp" in record_data:
                 records.append(record_data)
@@ -316,7 +321,7 @@ class FitFile:
                 & (self.resampled_df["timestamp"] <= end_time)
             ]
             logger.debug(
-                f"Lap {i+1}: {len(lap_records)} records between {start_time} and {end_time}"
+                f"Lap {i + 1}: {len(lap_records)} records between {start_time} and {end_time}"
             )
 
             # Calculate distance and duration
@@ -450,3 +455,21 @@ class FitFile:
 
     def get_elevation_error_rate(self):
         return self.elevation_error_rate
+
+    def has_wind_speed_data(self):
+        """Check if the FIT file contains wind speed data"""
+        if not hasattr(self, "resampled_df") or self.resampled_df is None:
+            return False
+
+        if "wind_speed" not in self.resampled_df.columns:
+            return False
+
+        # Check if there's any non-null wind speed data
+        wind_data = self.resampled_df["wind_speed"]
+        return not wind_data.isna().all()
+
+    def get_wind_speed_data(self):
+        """Get wind speed data if available, otherwise return None"""
+        if not self.has_wind_speed_data():
+            return None
+        return self.resampled_df["wind_speed"].values

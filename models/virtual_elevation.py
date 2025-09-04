@@ -46,6 +46,9 @@ class VirtualElevation:
 
         self.wind_direction = params.get("wind_direction")
 
+        # FIT file wind speed data (array of wind speeds per timestamp)
+        self.fit_wind_speed = params.get("fit_wind_speed")
+
         # Process data
         self.prepare_data()
 
@@ -82,7 +85,6 @@ class VirtualElevation:
             if "altitude" in self.df.columns:
                 self.df.loc[:, "altitude"] = 0
 
-
         # Log data quality before processing
         zero_speed_count = (self.df["v"] == 0).sum()
         nan_speed_count = self.df["v"].isna().sum()
@@ -97,8 +99,12 @@ class VirtualElevation:
         # Calculate acceleration
         self.calculate_acceleration()
 
-        # Calculate effective wind if direction is provided
-        if self.wind_speed != 0 and self.wind_direction is not None:
+        # Calculate effective wind based on wind source
+        if self.fit_wind_speed is not None:
+            # Use FIT file wind speed data (already relative to rider direction)
+            self.apply_fit_wind_speed()
+        elif self.wind_speed != 0 and self.wind_direction is not None:
+            # Use constant wind with direction calculation
             self.calculate_effective_wind()
         else:
             # Set a default value of 0 for wind speed
@@ -139,11 +145,17 @@ class VirtualElevation:
         vg = self.df["v"].values
         acc = self.df["a"].values
 
-        # Calculate effective wind based on direction
-        if self.wind_speed != 0 and self.wind_direction is not None:
-            effective_wind = self.calculate_effective_wind()
+        # Use effective wind from dataframe (calculated in prepare_data)
+        if "vw" in self.df.columns:
+            effective_wind = self.df["vw"].values
         else:
-            effective_wind = np.full_like(vg, self.wind_speed)
+            # Fallback: calculate effective wind if not in dataframe
+            if self.wind_speed != 0 and self.wind_direction is not None:
+                effective_wind = self.calculate_effective_wind()
+            else:
+                effective_wind = np.full_like(
+                    vg, self.wind_speed if self.wind_speed is not None else 0
+                )
 
         # Apparent velocity is ground velocity + effective wind
         va = vg + effective_wind
@@ -554,3 +566,27 @@ class VirtualElevation:
                 effective_wind = np.convolve(effective_wind, kernel, mode="same")
 
         return effective_wind
+
+    def apply_fit_wind_speed(self):
+        """
+        Apply FIT file wind speed data directly to the dataframe.
+        FIT wind_speed is already relative to rider direction (positive=headwind, negative=tailwind).
+        """
+        import numpy as np
+
+        if self.fit_wind_speed is None:
+            self.df["vw"] = 0
+            return
+
+        # Ensure we have the same number of data points
+        min_len = min(len(self.df), len(self.fit_wind_speed))
+
+        if min_len < len(self.df):
+            # Pad with zeros if FIT wind data is shorter
+            wind_data = np.zeros(len(self.df))
+            wind_data[:min_len] = self.fit_wind_speed[:min_len]
+        else:
+            # Trim if FIT wind data is longer
+            wind_data = self.fit_wind_speed[: len(self.df)]
+
+        self.df["vw"] = wind_data
