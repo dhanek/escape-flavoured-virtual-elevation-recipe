@@ -3,17 +3,13 @@
 <img src=".assets/VE_icon.png" width="128" height="128" alt="Virtual Elevation Analyzer Icon">
 
 ## TODO
-- [x] Load FIT file parsing in background thread to keep UI responsive
-- [x] Move slider calculations to background thread to prevent UI blocking
 - [ ] Add unit tests for core VirtualElevation functionality
-- [x] Refactor GPS analysis windows to extract common base class (reduce ~2,400 lines of duplication)
-- [x] Add comprehensive exception handling and user-friendly error messages
 - [ ] Add documentation for obtaining DEM elevation data sources by country/region
   - [ ] list of DEM file sources for regions beyond France
-- [x] Create standalone executables for Windows/MacOS/Linux that actually work for one-click launch without Python installation
-- [x] text field near the slider to input specific values
 - [ ] test moving rho and ETA in the slider view
-- [x] Use PyQtGraph instead of Matplotlib for faster rendering
+- [ ] investigate change from fitparse to either fitdecode or to garmin_fit_sdk
+- [ ] add support for fit files without power data by forcing all power to 0 (right now it doesn't work)
+- [ ] investigate the problem when courses cross the boundaries of elevation data files
 
 ## Introduction
 This tool implements the Virtual Elevation method ("Chung Method") developed by Robert Chung, which allows for the estimation of a cyclist's aerodynamic parameters (CdA) and rolling resistance (Crr) using power, speed and elevation data from cycling activities.
