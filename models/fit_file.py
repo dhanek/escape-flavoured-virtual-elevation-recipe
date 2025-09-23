@@ -219,11 +219,16 @@ class FitFile:
         initial_record_count = len(self.records_df)
         logger.debug(f"Initial record count: {initial_record_count}")
 
-        # drop any row from records_df that has a NaN value in timestamp, speed, or power columns
-        self.records_df.dropna(subset=["timestamp", "speed", "power"], inplace=True)
+        # Check if power data exists, if not create column with zeros
+        if "power" not in self.records_df.columns or self.records_df["power"].isna().all():
+            logger.info("No power data found in FIT file, using zeros for all power values")
+            self.records_df["power"] = 0.0
+
+        # drop any row from records_df that has a NaN value in timestamp or speed columns
+        self.records_df.dropna(subset=["timestamp", "speed"], inplace=True)
         after_dropna_count = len(self.records_df)
         logger.debug(
-            f"After dropping NaN (timestamp/speed/power): {after_dropna_count} (removed {initial_record_count - after_dropna_count})"
+            f"After dropping NaN (timestamp/speed): {after_dropna_count} (removed {initial_record_count - after_dropna_count})"
         )
 
         self.laps_df = pd.DataFrame(lap_records)
@@ -277,6 +282,13 @@ class FitFile:
         if "timestamp" not in self.records_df.columns:
             raise ValueError("No timestamp data found in FIT file")
 
+        # Fill NaN power values with zeros before resampling
+        if "power" in self.records_df.columns:
+            nan_power_count = self.records_df["power"].isna().sum()
+            if nan_power_count > 0:
+                logger.debug(f"Filling {nan_power_count} NaN power values with zeros")
+                self.records_df["power"] = self.records_df["power"].fillna(0.0)
+
         # Set timestamp as index
         self.records_df.set_index("timestamp", inplace=True)
         logger.debug(f"Records before resampling: {len(self.records_df)}")
@@ -284,6 +296,13 @@ class FitFile:
         # Resample to 1s intervals (use 's' instead of 'S' to avoid FutureWarning)
         self.resampled_df = self.records_df.resample("1s").interpolate(method="linear")
         logger.debug(f"Records after resampling: {len(self.resampled_df)}")
+
+        # Fill any power NaN values created during resampling with zeros
+        if "power" in self.resampled_df.columns:
+            resampled_nan_power_count = self.resampled_df["power"].isna().sum()
+            if resampled_nan_power_count > 0:
+                logger.debug(f"Filling {resampled_nan_power_count} NaN power values created during resampling with zeros")
+                self.resampled_df["power"] = self.resampled_df["power"].fillna(0.0)
 
         # Reset index to have timestamp as a column
         self.resampled_df.reset_index(inplace=True)
