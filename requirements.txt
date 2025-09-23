@@ -1,4 +1,4 @@
-fitparse>=1.2.0
+fitdecode>=0.10.0
 folium>=0.20.0
 matplotlib>=3.10.5
 numpy>=2.3.2

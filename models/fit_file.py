@@ -4,7 +4,7 @@ import threading
 import numpy as np
 import pandas as pd
 import rasterio
-from fitparse import FitFile as FitParser
+import fitdecode
 from pyproj import Transformer
 from rasterio.windows import Window
 
@@ -85,7 +85,6 @@ class FitFile:
         self.elevation_error_rate = 0
 
         self.filename = filename
-        self.fit_parser = FitParser(filename)
 
         # Extract data
         self.laps = []
@@ -112,105 +111,111 @@ class FitFile:
         records = []
         lap_records = []
 
-        # Process lap messages
-        for message in self.fit_parser.get_messages("lap"):
-            lap_data = {}
-            for data in message:
-                # Include enhanced_avg_speed in data collection
-                if data.name in [
-                    "start_time",
-                    "timestamp",
-                    "total_elapsed_time",
-                    "total_distance",
-                    "avg_power",
-                    "avg_speed",
-                    "enhanced_avg_speed",  # Added enhanced_avg_speed
-                    "max_speed",
-                    "enhanced_max_speed",  # Added enhanced_max_speed
-                    "start_position_lat",
-                    "start_position_long",
-                ]:
-                    lap_data[data.name] = data.value
+        # Process lap and record messages using fitdecode
+        with fitdecode.FitReader(self.filename) as fit_file:
+            for frame in fit_file:
+                if frame.frame_type == fitdecode.FIT_FRAME_DATA:
+                    # Cast to FitDataMessage for type checking
+                    data_frame = frame
+                    if data_frame.name == "lap":
+                        lap_data = {}
+                        # Include enhanced_avg_speed in data collection
+                        field_names = [
+                            "start_time",
+                            "timestamp",
+                            "total_elapsed_time",
+                            "total_distance",
+                            "avg_power",
+                            "avg_speed",
+                            "enhanced_avg_speed",  # Added enhanced_avg_speed
+                            "max_speed",
+                            "enhanced_max_speed",  # Added enhanced_max_speed
+                            "start_position_lat",
+                            "start_position_long",
+                        ]
 
-            # Prefer enhanced values over non-enhanced ones
-            if "enhanced_avg_speed" in lap_data:
-                lap_data["avg_speed"] = lap_data["enhanced_avg_speed"]
+                        for field_name in field_names:
+                            if data_frame.has_field(field_name):
+                                lap_data[field_name] = data_frame.get_value(field_name)
 
-            if "enhanced_max_speed" in lap_data:
-                lap_data["max_speed"] = lap_data["enhanced_max_speed"]
+                        # Prefer enhanced values over non-enhanced ones
+                        if "enhanced_avg_speed" in lap_data:
+                            lap_data["avg_speed"] = lap_data["enhanced_avg_speed"]
 
-            if (
-                "start_time" in lap_data
-                and "timestamp" in lap_data
-                and "total_elapsed_time" in lap_data
-            ):
-                # In FIT files, 'timestamp' is usually the end time of the lap
-                lap_data["end_time"] = lap_data["timestamp"]
+                        if "enhanced_max_speed" in lap_data:
+                            lap_data["max_speed"] = lap_data["enhanced_max_speed"]
 
-                # Verify times make sense - if timestamp equals start_time, calculate proper end_time
-                if lap_data["end_time"] <= lap_data["start_time"]:
-                    # Calculate end time from start time and duration
-                    if (
-                        "total_elapsed_time" in lap_data
-                        and lap_data["total_elapsed_time"] > 0
-                    ):
-                        lap_data["end_time"] = lap_data["start_time"] + pd.Timedelta(
-                            seconds=lap_data["total_elapsed_time"]
-                        )
-
-                # Convert start position from semicircles to degrees if available
-                if (
-                    "start_position_lat" in lap_data
-                    and "start_position_long" in lap_data
-                ):
-                    if (
-                        lap_data["start_position_lat"] is not None
-                        and lap_data["start_position_long"] is not None
-                    ):
-                        if isinstance(
-                            lap_data["start_position_lat"], (int, np.int32, np.int64)
+                        if (
+                            "start_time" in lap_data
+                            and "timestamp" in lap_data
+                            and "total_elapsed_time" in lap_data
                         ):
-                            lap_data["start_position_lat"] = lap_data[
-                                "start_position_lat"
-                            ] * (180 / 2**31)
-                            lap_data["start_position_long"] = lap_data[
-                                "start_position_long"
-                            ] * (180 / 2**31)
-            lap_records.append(lap_data)
+                            # In FIT files, 'timestamp' is usually the end time of the lap
+                            lap_data["end_time"] = lap_data["timestamp"]
 
-        self.check_canceled()
+                            # Verify times make sense - if timestamp equals start_time, calculate proper end_time
+                            if lap_data["end_time"] <= lap_data["start_time"]:
+                                # Calculate end time from start time and duration
+                                if (
+                                    "total_elapsed_time" in lap_data
+                                    and lap_data["total_elapsed_time"] > 0
+                                ):
+                                    lap_data["end_time"] = lap_data["start_time"] + pd.Timedelta(
+                                        seconds=lap_data["total_elapsed_time"]
+                                    )
 
-        # Process record messages
-        for message in self.fit_parser.get_messages("record"):
-            record_data = {}
-            for data in message:
-                if data.name in [
-                    "timestamp",
-                    "distance",
-                    "position_lat",
-                    "position_long",
-                    "speed",
-                    "enhanced_speed",  # Added enhanced_speed
-                    "power",
-                    "altitude",
-                    "enhanced_altitude",  # Added enhanced_altitude
-                    "wind_speed",  # Added wind_speed
-                ]:
-                    record_data[data.name] = data.value
+                            # Convert start position from semicircles to degrees if available
+                            if (
+                                "start_position_lat" in lap_data
+                                and "start_position_long" in lap_data
+                            ):
+                                if (
+                                    lap_data["start_position_lat"] is not None
+                                    and lap_data["start_position_long"] is not None
+                                ):
+                                    if isinstance(
+                                        lap_data["start_position_lat"], (int, np.int32, np.int64)
+                                    ):
+                                        lap_data["start_position_lat"] = lap_data[
+                                            "start_position_lat"
+                                        ] * (180 / 2**31)
+                                        lap_data["start_position_long"] = lap_data[
+                                            "start_position_long"
+                                        ] * (180 / 2**31)
+                        lap_records.append(lap_data)
 
-            # Prefer enhanced values over non-enhanced ones
-            if "enhanced_speed" in record_data:
-                record_data["speed"] = record_data["enhanced_speed"]
+                    elif data_frame.name == "record":
+                        record_data = {}
+                        field_names = [
+                            "timestamp",
+                            "distance",
+                            "position_lat",
+                            "position_long",
+                            "speed",
+                            "enhanced_speed",  # Added enhanced_speed
+                            "power",
+                            "altitude",
+                            "enhanced_altitude",  # Added enhanced_altitude
+                            "wind_speed",  # Added wind_speed
+                        ]
 
-            if "enhanced_altitude" in record_data:
-                record_data["altitude"] = record_data["enhanced_altitude"]
+                        for field_name in field_names:
+                            if data_frame.has_field(field_name):
+                                record_data[field_name] = data_frame.get_value(field_name)
 
-            # Convert wind_speed from m/s * 1000 to m/s
-            if "wind_speed" in record_data and record_data["wind_speed"] is not None:
-                record_data["wind_speed"] = record_data["wind_speed"] / 1000.0
+                        # Prefer enhanced values over non-enhanced ones
+                        if "enhanced_speed" in record_data:
+                            record_data["speed"] = record_data["enhanced_speed"]
 
-            if "timestamp" in record_data:
-                records.append(record_data)
+                        if "enhanced_altitude" in record_data:
+                            record_data["altitude"] = record_data["enhanced_altitude"]
+
+                        # Convert wind_speed from m/s * 1000 to m/s
+                        if "wind_speed" in record_data and record_data["wind_speed"] is not None:
+                            record_data["wind_speed"] = record_data["wind_speed"] / 1000.0
+
+                        if "timestamp" in record_data:
+                            records.append(record_data)
 
         self.check_canceled()
 
