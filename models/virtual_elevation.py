@@ -70,9 +70,13 @@ class VirtualElevation:
         else:
             raise ValueError("Speed data is required")
 
-        # Ensure power is present
+        # Ensure power is present, create zeros if missing
         if "power" not in self.df.columns:
-            raise ValueError("Power data is required")
+            logger.info("No power data found, using zeros for all power values")
+            self.df["power"] = 0.0
+        elif self.df["power"].isna().all():
+            logger.info("All power data is NaN, using zeros for all power values")
+            self.df["power"] = 0.0
 
         self.df["watts"] = self.df["power"]
 
