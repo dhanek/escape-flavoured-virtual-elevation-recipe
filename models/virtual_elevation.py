@@ -593,4 +593,6 @@ class VirtualElevation:
             # Trim if FIT wind data is longer
             wind_data = self.fit_wind_speed[: len(self.df)]
 
+        # Handle NaN values in FIT wind data by replacing with 0
+        wind_data = np.nan_to_num(wind_data, nan=0.0)
         self.df["vw"] = wind_data
