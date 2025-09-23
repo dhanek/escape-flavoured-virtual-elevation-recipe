@@ -9,7 +9,7 @@ description = "Virtual Elevation Analyzer - PySide6 desktop application for cycl
 readme = "README.md"
 requires-python = ">=3.13.5"
 dependencies = [
-    "fitparse>=1.2.0",
+    "fitdecode>=0.10.0",
     "folium>=0.20.0",
     "matplotlib>=3.10.5",
     "numpy>=2.3.2",

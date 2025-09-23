@@ -7,7 +7,7 @@
 - [ ] Add documentation for obtaining DEM elevation data sources by country/region
   - [ ] list of DEM file sources for regions beyond France
 - [ ] test moving rho and ETA in the slider view
-- [ ] investigate change from fitparse to either fitdecode or to garmin_fit_sdk
+- [x] investigate change from fitparse to either fitdecode or to garmin_fit_sdk
 - [x] add support for fit files without power data by forcing all power to 0 (right now it doesn't work)
 - [ ] investigate the problem when courses cross the boundaries of elevation data files
 
@@ -44,7 +44,7 @@ pip install -r requirements.txt
 - pandas
 - numpy
 - matplotlib
-- fitparse
+- fitdecode
 - folium
 - platformdirs
 
