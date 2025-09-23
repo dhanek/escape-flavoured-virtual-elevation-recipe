@@ -1,10 +1,11 @@
 import csv
+import logging
 import os
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import Qt, QThread
+from PySide6.QtCore import Qt, QThread, QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QFormLayout,
@@ -28,6 +29,8 @@ from ui.async_worker import AsyncWorker
 from ui.map_widget import MapMode, MapWidget
 from ui.slider_textbox import SliderTextBox
 from ui.ve_plot import VEFigure, VEPlotLabel, VEPlotSaver
+
+logger = logging.getLogger(__name__)
 
 
 class VEWorker(AsyncWorker):
@@ -91,7 +94,7 @@ class VEWorker(AsyncWorker):
             self.params.get("wind_speed")
             and self.params.get("wind_direction") is not None
         )
-        has_fit_wind = self.params.get("fit_wind_speed") is not None
+        has_fit_wind = self.params.get("fit_wind_data_for_plot") is not None
 
         if has_constant_wind or has_fit_wind:
             self.create_wind_plot()
@@ -160,42 +163,57 @@ class VEWorker(AsyncWorker):
         if "fit_wind_speed" in constant_wind_params:
             del constant_wind_params["fit_wind_speed"]
 
-        # Create VE calculator for constant wind
-        ve_calc_constant = VirtualElevation(self.merged_data, constant_wind_params)
-        self.virtual_elevation_constant_wind = ve_calc_constant.calculate_ve(
-            self.current_cda, self.current_crr
-        )
+        # Initialize results to None
+        self.virtual_elevation_constant_wind = None
+        self.virtual_elevation_calibrated_constant_wind = None
+        self.r2_constant_wind = None
+        self.rmse_constant_wind = None
 
-        # Use existing calculator for FIT wind (already has fit_wind_speed)
-        self.virtual_elevation_fit_wind = self.ve_calculator.calculate_ve(
-            self.current_cda, self.current_crr
-        )
+        try:
+            # Create VE calculator for constant wind
+            ve_calc_constant = VirtualElevation(self.merged_data, constant_wind_params)
+            self.virtual_elevation_constant_wind = ve_calc_constant.calculate_ve(
+                self.current_cda, self.current_crr
+            )
 
-        # For primary results, use FIT wind results
-        self.virtual_elevation = self.virtual_elevation_fit_wind
+            # Calculate metrics for constant wind
+            if self.virtual_elevation_constant_wind is not None:
+                self._calculate_metrics_and_calibration(
+                    self.virtual_elevation_constant_wind,
+                    "r2_constant_wind",
+                    "rmse_constant_wind",
+                    "ve_elevation_diff_constant_wind",
+                    "virtual_elevation_calibrated_constant_wind",
+                )
+        except Exception as e:
+            logger.error(f"Error calculating constant wind VE: {e}")
 
-        # Calculate metrics for both
-        self._calculate_metrics_and_calibration(
-            self.virtual_elevation_constant_wind,
-            "r2_constant_wind",
-            "rmse_constant_wind",
-            "ve_elevation_diff_constant_wind",
-            "virtual_elevation_calibrated_constant_wind",
-        )
+        try:
+            # Use existing calculator for FIT wind (already has fit_wind_speed)
+            self.virtual_elevation_fit_wind = self.ve_calculator.calculate_ve(
+                self.current_cda, self.current_crr
+            )
 
-        self._calculate_metrics_and_calibration(
-            self.virtual_elevation_fit_wind,
-            "r2_fit_wind",
-            "rmse_fit_wind",
-            "ve_elevation_diff_fit_wind",
-            "virtual_elevation_calibrated_fit_wind",
-        )
+            # For primary results, use FIT wind results
+            self.virtual_elevation = self.virtual_elevation_fit_wind
 
-        # Set primary results to FIT wind results
-        self.r2 = self.r2_fit_wind
-        self.rmse = self.rmse_fit_wind
-        self.ve_elevation_diff = self.ve_elevation_diff_fit_wind
-        self.virtual_elevation_calibrated = self.virtual_elevation_calibrated_fit_wind
+            # Calculate metrics for FIT wind
+            if self.virtual_elevation_fit_wind is not None:
+                self._calculate_metrics_and_calibration(
+                    self.virtual_elevation_fit_wind,
+                    "r2_fit_wind",
+                    "rmse_fit_wind",
+                    "ve_elevation_diff_fit_wind",
+                    "virtual_elevation_calibrated_fit_wind",
+                )
+
+                # Set primary results to FIT wind results
+                self.r2 = self.r2_fit_wind
+                self.rmse = self.rmse_fit_wind
+                self.ve_elevation_diff = self.ve_elevation_diff_fit_wind
+                self.virtual_elevation_calibrated = self.virtual_elevation_calibrated_fit_wind
+        except Exception as e:
+            logger.error(f"Error calculating FIT wind VE: {e}")
 
     def _calculate_metrics_and_calibration(
         self, ve_data, r2_attr, rmse_attr, diff_attr, calibrated_attr
@@ -304,6 +322,8 @@ class VEWorker(AsyncWorker):
             self.is_comparison_mode
             and hasattr(self, "virtual_elevation_calibrated_constant_wind")
             and hasattr(self, "virtual_elevation_calibrated_fit_wind")
+            and self.virtual_elevation_calibrated_constant_wind is not None
+            and self.virtual_elevation_calibrated_fit_wind is not None
         ):
             # Comparison mode: plot both constant wind and FIT wind profiles
             trim_end = min(
@@ -597,7 +617,7 @@ class VEWorker(AsyncWorker):
             ground_plus_constant = ground_speed
 
         # FIT wind apparent speed
-        fit_wind_data = self.params.get("fit_wind_speed")
+        fit_wind_data = self.params.get("fit_wind_data_for_plot")
         if fit_wind_data is not None:
             min_len = min(len(ground_speed), len(fit_wind_data))
             fit_wind_kmh = np.nan_to_num(fit_wind_data[:min_len] * 3.6, nan=0.0)
@@ -788,6 +808,12 @@ class AnalysisResult(QMainWindow):
 
         # Setup UI
         self.initUI()
+
+        # Initialize debounce timer for wind source changes
+        self.wind_source_timer = QTimer()
+        self.wind_source_timer.setSingleShot(True)
+        self.wind_source_timer.timeout.connect(self._apply_wind_source_change)
+        self.pending_wind_source = None
 
         # Create VE worker after UI initialization so plot_size_info is available
         self.ve_worker = VEWorker(self.merged_data, self.get_current_params())
@@ -1094,26 +1120,46 @@ class AnalysisResult(QMainWindow):
         self.update_config_text()
 
     def on_wind_source_changed(self):
-        """Handle wind source radio button changes"""
+        """Handle wind source radio button changes with debouncing"""
+        # Determine the new wind source
+        new_wind_source = "constant"  # default
         if (
             hasattr(self, "wind_constant_radio")
             and self.wind_constant_radio.isChecked()
         ):
-            self.wind_source = "constant"
+            new_wind_source = "constant"
         elif hasattr(self, "wind_fit_radio") and self.wind_fit_radio.isChecked():
-            self.wind_source = "fit"
+            new_wind_source = "fit"
         elif (
             hasattr(self, "wind_compare_radio") and self.wind_compare_radio.isChecked()
         ):
-            self.wind_source = "compare"
+            new_wind_source = "compare"
 
-        # Recreate VE worker with new parameters (AsyncWorker doesn't have stop method)
-        self.ve_worker = VEWorker(self.merged_data, self.get_current_params())
-        self.ve_worker.moveToThread(self.ve_thread)
-        self.ve_worker.resultReady.connect(self.on_ve_result_ready)
+        # Store the pending change and start/restart the debounce timer
+        self.pending_wind_source = new_wind_source
+        self.wind_source_timer.start(300)  # 300ms debounce delay
 
-        self.async_update()
-        self.update_config_text()
+    def _apply_wind_source_change(self):
+        """Apply the wind source change after debounce delay"""
+        if self.pending_wind_source and self.pending_wind_source != self.wind_source:
+            self.wind_source = self.pending_wind_source
+
+            # Recreate VE worker with new parameters (AsyncWorker doesn't have stop method)
+            # Disconnect the old worker first
+            if hasattr(self, 've_worker') and self.ve_worker:
+                try:
+                    self.ve_worker.resultReady.disconnect()
+                except (RuntimeError, TypeError):
+                    pass  # Ignore if already disconnected or connection doesn't exist
+
+            self.ve_worker = VEWorker(self.merged_data, self.get_current_params())
+            self.ve_worker.moveToThread(self.ve_thread)
+            self.ve_worker.resultReady.connect(self.on_ve_result_ready)
+
+            self.async_update()
+            self.update_config_text()
+
+        self.pending_wind_source = None
 
     def get_current_params(self):
         """Get current parameters including wind data based on wind source selection"""
@@ -1133,13 +1179,13 @@ class AnalysisResult(QMainWindow):
         # Set comparison mode flag
         current_params["comparison_mode"] = self.wind_source == "compare"
 
-        # Always add fit_wind_speed when available (for wind plot generation)
-        if self.has_fit_wind and "fit_wind_speed" not in current_params:
+        # Add FIT wind data separately for wind plot generation (doesn't affect VE calculation)
+        if self.has_fit_wind:
             fit_wind_data = self.fit_file.get_wind_speed_data()
             if fit_wind_data is not None:
                 min_len = min(len(self.merged_data), len(fit_wind_data))
                 wind_for_laps = fit_wind_data[:min_len]
-                current_params["fit_wind_speed"] = wind_for_laps
+                current_params["fit_wind_data_for_plot"] = wind_for_laps
 
         # Add plot size info for high-quality rendering - always get fresh size info
         if hasattr(self, "wind_plot") and self.wind_plot:
