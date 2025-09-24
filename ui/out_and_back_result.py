@@ -1276,6 +1276,9 @@ class OutAndBackResult(QMainWindow):
         main_widget.setLayout(main_layout)
         self.setCentralWidget(main_widget)
 
+        # Maximize the window
+        self.showMaximized()
+
     def update_config_text(self):
         """Update the configuration text display"""
         lap_str = ", ".join(map(str, self.selected_laps))

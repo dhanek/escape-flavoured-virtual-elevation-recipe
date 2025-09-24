@@ -1156,6 +1156,9 @@ class GPSGateResult(QMainWindow):
         main_widget.setLayout(main_layout)
         self.setCentralWidget(main_widget)
 
+        # Maximize the window
+        self.showMaximized()
+
     def create_gate_control_group(self, gate_index):
         """Create a control group for a gate set"""
         gate_set = self.gate_sets[gate_index]
