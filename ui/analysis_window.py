@@ -221,6 +221,9 @@ class AnalysisWindow(QMainWindow):
         main_widget.setLayout(main_layout)
         self.setCentralWidget(main_widget)
 
+        # Maximize the window
+        self.showMaximized()
+
     def populate_lap_table(self):
         """Populate the lap table with data from FIT file"""
         lap_data = self.fit_file.get_lap_data()
