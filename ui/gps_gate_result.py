@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSplitter,
     QTableWidget,
@@ -45,6 +46,7 @@ class VEWorker(AsyncWorker):
         "gate_sets",
         "selected_section_indices",
         "plot_size_info",
+        "wind_source",  # Still needed to determine constant vs FIT mode
     ]
 
     RESULT_KEYS = [
@@ -381,8 +383,22 @@ class VEWorker(AsyncWorker):
             # Extract section data
             section_data = self.merged_data.iloc[start_idx : end_idx + 1].copy()
 
+            # Get current parameters
+            section_params = self.params.copy()
+
+            # Set comparison mode flag
+            section_params["comparison_mode"] = self.wind_source == "compare"
+
+            # For constant wind mode, remove air_speed/wind_speed columns so VE uses constant wind
+            if self.wind_source == "constant":
+                if "air_speed" in section_data.columns:
+                    section_data = section_data.drop(columns=["air_speed"])
+                if "wind_speed" in section_data.columns:
+                    section_data = section_data.drop(columns=["wind_speed"])
+
             # Create VE calculator for this section
-            ve_calculator = VirtualElevation(section_data, self.params)
+            # Wind/air speed data is automatically handled from DataFrame columns
+            ve_calculator = VirtualElevation(section_data, section_params)
 
             # Calculate VE
             ve = ve_calculator.calculate_ve(self.current_cda, self.current_crr)
@@ -775,12 +791,21 @@ class GPSGateResult(QMainWindow):
         # Prepare merged lap data
         self.prepare_merged_data()
 
-        self.ve_worker = VEWorker(self.merged_data, self.params)
+        # Wind source settings
+        self.has_fit_wind = self.fit_file.has_wind_speed_data()
+        self.has_fit_air = self.fit_file.has_air_speed_data()
+        self.wind_source = "constant"  # Default to constant wind
+
+        # Ensure valid wind source if no FIT wind or air data
+        if not (self.has_fit_wind or self.has_fit_air):
+            self.wind_source = "constant"
+
+        self.ve_worker = VEWorker(self.merged_data, self.get_current_params())
         self.ve_thread = QThread()
         self.ve_worker.moveToThread(self.ve_thread)
         self.ve_worker.resultReady.connect(self.on_ve_result_ready)
         self.ve_plot_saver = VEPlotSaver(
-            VEWorker(self.merged_data, self.params), self.ve_thread
+            VEWorker(self.merged_data, self.get_current_params()), self.ve_thread
         )
         self.ve_thread.start()
         QApplication.instance().aboutToQuit.connect(self.join_threads)
@@ -1138,6 +1163,35 @@ class GPSGateResult(QMainWindow):
         params_group.setLayout(params_layout)
         slider_content_layout.addWidget(params_group)
 
+        # Wind source controls (only show if FIT wind or air data is available)
+        if self.has_fit_wind or self.has_fit_air:
+            wind_group = QGroupBox("Wind Source")
+            wind_layout = QVBoxLayout()
+
+            self.wind_constant_radio = QRadioButton("Use constant wind settings")
+            self.wind_fit_radio = QRadioButton("Use FIT file wind speed")
+            self.wind_compare_radio = QRadioButton("Compare both methods")
+
+            # Set initial selection
+            if self.wind_source == "constant":
+                self.wind_constant_radio.setChecked(True)
+            elif self.wind_source == "fit":
+                self.wind_fit_radio.setChecked(True)
+            elif self.wind_source == "compare":
+                self.wind_compare_radio.setChecked(True)
+
+            # Connect signals
+            self.wind_constant_radio.toggled.connect(self.on_wind_source_changed)
+            self.wind_fit_radio.toggled.connect(self.on_wind_source_changed)
+            self.wind_compare_radio.toggled.connect(self.on_wind_source_changed)
+
+            wind_layout.addWidget(self.wind_constant_radio)
+            wind_layout.addWidget(self.wind_fit_radio)
+            wind_layout.addWidget(self.wind_compare_radio)
+
+            wind_group.setLayout(wind_layout)
+            slider_content_layout.addWidget(wind_group)
+
         # Add a stretch at the end to push everything up
         slider_content_layout.addStretch()
 
@@ -1394,6 +1448,19 @@ class GPSGateResult(QMainWindow):
 
         return selected_indices
 
+    def get_current_params(self):
+        """Get current parameters including wind data based on wind source selection"""
+        current_params = self.params.copy()
+
+        # NOTE: For GPS gate analysis, we don't pass global wind/air speed data here
+        # because each detected section will extract its own portion of the data.
+        # Wind/air speed data will be handled per-section in calculate_ve().
+
+        # Set comparison mode flag
+        current_params["comparison_mode"] = self.wind_source == "compare"
+
+        return current_params
+
     def toggle_all_sections_selection(self):
         """Toggle selection of all sections based on current state"""
         # Check current state - count selected checkboxes
@@ -1556,6 +1623,39 @@ class GPSGateResult(QMainWindow):
         # Recalculate VE and update plots
         self.async_update(detect_sections=False)
         self.update_config_text()
+
+    def on_wind_source_changed(self):
+        """Handle wind source radio button changes"""
+        # Determine the new wind source
+        new_wind_source = "constant"  # default
+        if (
+            hasattr(self, "wind_constant_radio")
+            and self.wind_constant_radio.isChecked()
+        ):
+            new_wind_source = "constant"
+        elif hasattr(self, "wind_fit_radio") and self.wind_fit_radio.isChecked():
+            new_wind_source = "fit"
+        elif (
+            hasattr(self, "wind_compare_radio") and self.wind_compare_radio.isChecked()
+        ):
+            new_wind_source = "compare"
+
+        # Only update if the source actually changed
+        if new_wind_source != self.wind_source:
+            self.wind_source = new_wind_source
+
+            # Recreate VE worker with new parameters
+            if hasattr(self, 've_worker') and self.ve_worker:
+                try:
+                    self.ve_worker.resultReady.disconnect()
+                except (RuntimeError, TypeError):
+                    pass  # Ignore if already disconnected or connection doesn't exist
+
+            self.ve_worker = VEWorker(self.merged_data, self.get_current_params())
+            self.ve_worker.moveToThread(self.ve_thread)
+            self.ve_worker.resultReady.connect(self.on_ve_result_ready)
+
+            self.async_update(detect_sections=False)
 
     def make_json_serializable(self, obj):
         """Convert objects that aren't JSON serializable to appropriate formats"""

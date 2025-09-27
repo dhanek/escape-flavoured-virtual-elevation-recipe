@@ -49,6 +49,9 @@ class VirtualElevation:
         # FIT file wind speed data (array of wind speeds per timestamp)
         self.fit_wind_speed = params.get("fit_wind_speed")
 
+        # FIT file air speed data (array of air speeds per timestamp - already wind_speed + ground_speed)
+        self.fit_air_speed = params.get("fit_air_speed")
+
         # Process data
         self.prepare_data()
 
@@ -103,9 +106,19 @@ class VirtualElevation:
         # Calculate acceleration
         self.calculate_acceleration()
 
-        # Calculate effective wind based on wind source
-        if self.fit_wind_speed is not None:
-            # Use FIT file wind speed data (already relative to rider direction)
+        # Calculate effective wind based on wind source (prioritize air_speed from DataFrame columns)
+        if "air_speed" in self.df.columns and self.df["air_speed"].notna().any():
+            # Use FIT file air speed data directly from DataFrame (already apparent wind velocity)
+            self.df["va_direct"] = self.df["air_speed"]
+            self.df["vw"] = 0  # Wind speed component not needed when using direct air speed
+        elif "wind_speed" in self.df.columns and self.df["wind_speed"].notna().any():
+            # Use FIT file wind speed data from DataFrame (already relative to rider direction)
+            self.df["vw"] = self.df["wind_speed"]
+        elif self.fit_air_speed is not None:
+            # Fallback: Use FIT file air speed data from parameters (legacy support)
+            self.apply_fit_air_speed()
+        elif self.fit_wind_speed is not None:
+            # Fallback: Use FIT file wind speed data from parameters (legacy support)
             self.apply_fit_wind_speed()
         elif self.wind_speed != 0 and self.wind_direction is not None:
             # Use constant wind with direction calculation
@@ -161,8 +174,12 @@ class VirtualElevation:
                     vg, self.wind_speed if self.wind_speed is not None else 0
                 )
 
-        # Apparent velocity is ground velocity + effective wind
-        va = vg + effective_wind
+        # Apparent velocity - use direct air speed if available, otherwise calculate
+        if "va_direct" in self.df.columns and self.df["va_direct"].notna().any():
+            va = self.df["va_direct"].values
+        else:
+            # Apparent velocity is ground velocity + effective wind
+            va = vg + effective_wind
 
         # Initialize result array with zeros (default slope)
         slope = np.zeros_like(vg, dtype=float)
@@ -596,3 +613,29 @@ class VirtualElevation:
         # Handle NaN values in FIT wind data by replacing with 0
         wind_data = np.nan_to_num(wind_data, nan=0.0)
         self.df["vw"] = wind_data
+
+    def apply_fit_air_speed(self):
+        """
+        Apply FIT file air speed data directly to the dataframe.
+        FIT air_speed is already apparent wind velocity (ground_speed + wind_speed).
+        """
+        import numpy as np
+
+        if self.fit_air_speed is None:
+            self.df["va_direct"] = None
+            return
+
+        # Ensure we have the same number of data points
+        min_len = min(len(self.df), len(self.fit_air_speed))
+
+        if min_len < len(self.df):
+            # Pad with zeros if FIT air data is shorter
+            air_data = np.zeros(len(self.df))
+            air_data[:min_len] = self.fit_air_speed[:min_len]
+        else:
+            # Trim if FIT air data is longer
+            air_data = self.fit_air_speed[: len(self.df)]
+
+        # Handle NaN values in FIT air data by replacing with 0
+        air_data = np.nan_to_num(air_data, nan=0.0)
+        self.df["va_direct"] = air_data

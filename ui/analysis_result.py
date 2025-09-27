@@ -40,6 +40,7 @@ class VEWorker(AsyncWorker):
         "current_cda",
         "current_crr",
         "plot_size_info",
+        "wind_source",
     ]
 
     RESULT_KEYS = [
@@ -70,13 +71,19 @@ class VEWorker(AsyncWorker):
         super(VEWorker, self).__init__()
         self.merged_data = merged_data
         self.params = params
-        # Create VE calculator
-        self.ve_calculator = VirtualElevation(self.merged_data, params)
+        self.ve_calculator = None
         self.ve_valid = False
+        self.current_wind_source = None
 
     def _process_value(self, value: dict):
         for key in VEWorker.INPUT_KEYS:
             setattr(self, key, value[key])
+
+        # Check if we need to recreate VE calculator due to wind source change
+        if self.current_wind_source != self.wind_source:
+            self._create_ve_calculator()
+            self.current_wind_source = self.wind_source
+            self.ve_valid = False
 
         if value["update_ve"] or not self.ve_valid:
             self.calculate_ve()
@@ -95,8 +102,9 @@ class VEWorker(AsyncWorker):
             and self.params.get("wind_direction") is not None
         )
         has_fit_wind = self.params.get("fit_wind_data_for_plot") is not None
+        has_fit_air = self.params.get("fit_air_data_for_plot") is not None
 
-        if has_constant_wind or has_fit_wind:
+        if has_constant_wind or has_fit_wind or has_fit_air:
             self.create_wind_plot()
         else:
             self.wind_plot_fig = None
@@ -106,8 +114,27 @@ class VEWorker(AsyncWorker):
 
         return out_values
 
+    def _create_ve_calculator(self):
+        """Create VE calculator with proper data based on wind source"""
+        # Get the data for VE calculation
+        ve_data = self.merged_data.copy()
+
+        # For constant wind mode, remove air_speed/wind_speed columns so VE uses constant wind
+        if self.wind_source == "constant":
+            if "air_speed" in ve_data.columns:
+                ve_data = ve_data.drop(columns=["air_speed"])
+            if "wind_speed" in ve_data.columns:
+                ve_data = ve_data.drop(columns=["wind_speed"])
+
+        # Create VE calculator with the prepared data
+        self.ve_calculator = VirtualElevation(ve_data, self.params)
+
     def calculate_ve(self):
         """Calculate virtual elevation with current parameters"""
+        # Ensure VE calculator is created
+        if self.ve_calculator is None:
+            self._create_ve_calculator()
+
         # Check if we're in comparison mode
         self.is_comparison_mode = self.params.get("comparison_mode", False)
 
@@ -158,10 +185,15 @@ class VEWorker(AsyncWorker):
         """Calculate both constant wind and FIT wind virtual elevation profiles"""
         from models.virtual_elevation import VirtualElevation
 
-        # Create parameters for constant wind (no fit_wind_speed)
-        constant_wind_params = self.params.copy()
-        if "fit_wind_speed" in constant_wind_params:
-            del constant_wind_params["fit_wind_speed"]
+        # Prepare data for constant wind (remove wind columns so it uses constant wind)
+        constant_wind_data = self.merged_data.copy()
+        if "air_speed" in constant_wind_data.columns:
+            constant_wind_data = constant_wind_data.drop(columns=["air_speed"])
+        if "wind_speed" in constant_wind_data.columns:
+            constant_wind_data = constant_wind_data.drop(columns=["wind_speed"])
+
+        # Prepare data for FIT wind (keep wind columns)
+        fit_wind_data = self.merged_data.copy()
 
         # Initialize results to None
         self.virtual_elevation_constant_wind = None
@@ -171,7 +203,7 @@ class VEWorker(AsyncWorker):
 
         try:
             # Create VE calculator for constant wind
-            ve_calc_constant = VirtualElevation(self.merged_data, constant_wind_params)
+            ve_calc_constant = VirtualElevation(constant_wind_data, self.params)
             self.virtual_elevation_constant_wind = ve_calc_constant.calculate_ve(
                 self.current_cda, self.current_crr
             )
@@ -189,8 +221,9 @@ class VEWorker(AsyncWorker):
             logger.error(f"Error calculating constant wind VE: {e}")
 
         try:
-            # Use existing calculator for FIT wind (already has fit_wind_speed)
-            self.virtual_elevation_fit_wind = self.ve_calculator.calculate_ve(
+            # Create VE calculator for FIT wind (with wind columns)
+            ve_calc_fit = VirtualElevation(fit_wind_data, self.params)
+            self.virtual_elevation_fit_wind = ve_calc_fit.calculate_ve(
                 self.current_cda, self.current_crr
             )
 
@@ -612,16 +645,24 @@ class VEWorker(AsyncWorker):
 
             ve_temp = VirtualElevation(self.merged_data, self.params)
             effective_wind = ve_temp.calculate_effective_wind() * 3.6
-            ground_plus_constant = ground_speed - effective_wind
+            ground_plus_constant = ground_speed + effective_wind
         else:
             ground_plus_constant = ground_speed
 
-        # FIT wind apparent speed
+        # FIT air speed or wind apparent speed
+        fit_air_data = self.params.get("fit_air_data_for_plot")
         fit_wind_data = self.params.get("fit_wind_data_for_plot")
-        if fit_wind_data is not None:
+
+        if fit_air_data is not None:
+            # Use air speed directly (already apparent wind velocity)
+            min_len = min(len(ground_speed), len(fit_air_data))
+            fit_air_kmh = np.nan_to_num(fit_air_data[:min_len] * 3.6, nan=0.0)
+            ground_plus_fit = fit_air_kmh[:min_len]
+        elif fit_wind_data is not None:
+            # Fall back to wind speed calculation
             min_len = min(len(ground_speed), len(fit_wind_data))
             fit_wind_kmh = np.nan_to_num(fit_wind_data[:min_len] * 3.6, nan=0.0)
-            ground_plus_fit = ground_speed[:min_len] - fit_wind_kmh
+            ground_plus_fit = ground_speed[:min_len] + fit_wind_kmh
         else:
             ground_plus_fit = ground_speed
 
@@ -643,8 +684,8 @@ class VEWorker(AsyncWorker):
             label="_nolegend_",
         )
 
-        # Only plot FIT wind if available
-        if fit_wind_data is not None:
+        # Only plot FIT air/wind if available
+        if fit_air_data is not None or fit_wind_data is not None:
             min_len = min(len(distance), len(ground_plus_fit))
             ax1.plot(
                 distance[:min_len],
@@ -661,8 +702,8 @@ class VEWorker(AsyncWorker):
             trim_ground = ground_speed[trim_start : trim_end + 1]
             trim_constant = ground_plus_constant[trim_start : trim_end + 1]
 
-            # Only plot FIT wind trimmed region if FIT wind data is available
-            if fit_wind_data is not None:
+            # Only plot FIT air/wind trimmed region if FIT air/wind data is available
+            if fit_air_data is not None or fit_wind_data is not None:
                 fit_trim_len = min(
                     len(trim_distance), len(ground_plus_fit) - trim_start
                 )
@@ -674,7 +715,7 @@ class VEWorker(AsyncWorker):
                         color="#4363d8",
                         alpha=1.0,
                         linewidth=4,
-                        label="Apparent (FIT Wind)",
+                        label="Apparent (FIT Air)" if fit_air_data is not None else "Apparent (FIT Wind)",
                     )
 
             ax1.plot(
@@ -768,12 +809,13 @@ class AnalysisResult(QMainWindow):
 
         # Wind source settings - initialize before creating VE worker
         self.has_fit_wind = self.fit_file.has_wind_speed_data()
+        self.has_fit_air = self.fit_file.has_air_speed_data()
         self.wind_source = saved_trim.get(
             "wind_source", "constant"
         )  # "constant", "fit", "compare"
 
-        # Ensure valid wind source if no FIT wind data
-        if not self.has_fit_wind and self.wind_source in ["fit", "compare"]:
+        # Ensure valid wind source if no FIT wind or air data
+        if not (self.has_fit_wind or self.has_fit_air) and self.wind_source in ["fit", "compare"]:
             self.wind_source = "constant"
 
         # Initialize UI values
@@ -941,7 +983,7 @@ class AnalysisResult(QMainWindow):
             self.params.get("wind_speed")
             and self.params.get("wind_direction") is not None
         )
-        if self.has_fit_wind or has_constant_wind:
+        if self.has_fit_wind or self.has_fit_air or has_constant_wind:
             wind_tab = QWidget()
             wind_layout = QVBoxLayout(wind_tab)
             self.wind_plot = VEPlotLabel(self.screen())
@@ -1005,8 +1047,8 @@ class AnalysisResult(QMainWindow):
 
         slider_layout.addRow("Crr:", self.crr_slider)
 
-        # Wind source controls (only show if FIT wind data is available)
-        if self.has_fit_wind:
+        # Wind source controls (only show if FIT wind or air data is available)
+        if self.has_fit_wind or self.has_fit_air:
             # Wind source radio buttons
             wind_layout = QVBoxLayout()
 
@@ -1168,26 +1210,19 @@ class AnalysisResult(QMainWindow):
         """Get current parameters including wind data based on wind source selection"""
         current_params = self.params.copy()
 
-        # Add FIT wind speed data if using FIT or comparison mode
-        if self.wind_source in ["fit", "compare"] and self.has_fit_wind:
-            # Get wind speed data for the selected laps
-            fit_wind_data = self.fit_file.get_wind_speed_data()
-            if fit_wind_data is not None:
-                # For now, we'll align by assuming both datasets have the same length after resampling
-                # In the future, this could be improved to align by timestamp
-                min_len = min(len(self.merged_data), len(fit_wind_data))
-                wind_for_laps = fit_wind_data[:min_len]
-                current_params["fit_wind_speed"] = wind_for_laps
-
         # Set comparison mode flag
         current_params["comparison_mode"] = self.wind_source == "compare"
 
-        # Add FIT wind data separately for wind plot generation (doesn't affect VE calculation)
-        if self.has_fit_wind:
-            fit_wind_data = self.fit_file.get_wind_speed_data()
-            if fit_wind_data is not None:
-                min_len = min(len(self.merged_data), len(fit_wind_data))
-                wind_for_laps = fit_wind_data[:min_len]
+        # Add FIT air/wind data separately for wind plot generation (doesn't affect VE calculation)
+        if self.has_fit_air and "air_speed" in self.merged_data.columns:
+            # Prioritize air speed data for plotting (already filtered for selected laps)
+            air_for_laps = self.merged_data["air_speed"].values
+            if not np.isnan(air_for_laps).all():
+                current_params["fit_air_data_for_plot"] = air_for_laps
+        elif self.has_fit_wind and "wind_speed" in self.merged_data.columns:
+            # Fall back to wind speed data for plotting (already filtered for selected laps)
+            wind_for_laps = self.merged_data["wind_speed"].values
+            if not np.isnan(wind_for_laps).all():
                 current_params["fit_wind_data_for_plot"] = wind_for_laps
 
         # Add plot size info for high-quality rendering - always get fresh size info

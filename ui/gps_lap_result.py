@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QRadioButton,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -41,6 +42,7 @@ class VEWorker(AsyncWorker):
         "gps_marker_pos",
         "selected_lap_indices",
         "plot_size_info",
+        "wind_source",  # Still needed to determine constant vs FIT mode
     ]
 
     RESULT_KEYS = [
@@ -348,8 +350,22 @@ class VEWorker(AsyncWorker):
 
             lap_data = self.merged_data.iloc[start_idx : end_idx + 1].copy()
 
+            # Get current parameters
+            lap_params = self.params.copy()
+
+            # Set comparison mode flag
+            lap_params["comparison_mode"] = self.wind_source == "compare"
+
+            # For constant wind mode, remove air_speed/wind_speed columns so VE uses constant wind
+            if self.wind_source == "constant":
+                if "air_speed" in lap_data.columns:
+                    lap_data = lap_data.drop(columns=["air_speed"])
+                if "wind_speed" in lap_data.columns:
+                    lap_data = lap_data.drop(columns=["wind_speed"])
+
             # Create a VE calculator for this lap
-            lap_ve_calculator = VirtualElevation(lap_data, self.params)
+            # Wind/air speed data is automatically handled from DataFrame columns
+            lap_ve_calculator = VirtualElevation(lap_data, lap_params)
 
             # Calculate VE
             ve = lap_ve_calculator.calculate_ve(self.current_cda, self.current_crr)
@@ -649,12 +665,21 @@ class GPSLapResult(QMainWindow):
         # Prepare merged lap data
         self.prepare_merged_data()
 
-        self.ve_worker = VEWorker(self.merged_data, self.params)
+        # Wind source settings
+        self.has_fit_wind = self.fit_file.has_wind_speed_data()
+        self.has_fit_air = self.fit_file.has_air_speed_data()
+        self.wind_source = "constant"  # Default to constant wind
+
+        # Ensure valid wind source if no FIT wind or air data
+        if not (self.has_fit_wind or self.has_fit_air):
+            self.wind_source = "constant"
+
+        self.ve_worker = VEWorker(self.merged_data, self.get_current_params())
         self.ve_thread = QThread()
         self.ve_worker.moveToThread(self.ve_thread)
         self.ve_worker.resultReady.connect(self.on_ve_result_ready)
         self.ve_plot_saver = VEPlotSaver(
-            VEWorker(self.merged_data, self.params), self.ve_thread
+            VEWorker(self.merged_data, self.get_current_params()), self.ve_thread
         )
         self.ve_thread.start()
         QApplication.instance().aboutToQuit.connect(self.join_threads)
@@ -937,6 +962,34 @@ class GPSLapResult(QMainWindow):
 
         slider_layout.addRow("Crr:", self.crr_slider)
 
+        # Wind source controls (only show if FIT wind or air data is available)
+        if self.has_fit_wind or self.has_fit_air:
+            # Wind source radio buttons
+            wind_layout = QVBoxLayout()
+
+            self.wind_constant_radio = QRadioButton("Use constant wind settings")
+            self.wind_fit_radio = QRadioButton("Use FIT file wind speed")
+            self.wind_compare_radio = QRadioButton("Compare both methods")
+
+            # Set initial selection
+            if self.wind_source == "constant":
+                self.wind_constant_radio.setChecked(True)
+            elif self.wind_source == "fit":
+                self.wind_fit_radio.setChecked(True)
+            elif self.wind_source == "compare":
+                self.wind_compare_radio.setChecked(True)
+
+            # Connect signals
+            self.wind_constant_radio.toggled.connect(self.on_wind_source_changed)
+            self.wind_fit_radio.toggled.connect(self.on_wind_source_changed)
+            self.wind_compare_radio.toggled.connect(self.on_wind_source_changed)
+
+            wind_layout.addWidget(self.wind_constant_radio)
+            wind_layout.addWidget(self.wind_fit_radio)
+            wind_layout.addWidget(self.wind_compare_radio)
+
+            slider_layout.addRow("Wind Source:", wind_layout)
+
         slider_group.setLayout(slider_layout)
         right_layout.addWidget(slider_group, 1)
 
@@ -1042,6 +1095,19 @@ class GPSLapResult(QMainWindow):
 
         return selected_indices
 
+    def get_current_params(self):
+        """Get current parameters including wind data based on wind source selection"""
+        current_params = self.params.copy()
+
+        # NOTE: For GPS lap analysis, we don't pass global wind/air speed data here
+        # because each detected lap will extract its own portion of the data.
+        # Wind/air speed data will be handled per-lap in calculate_ve().
+
+        # Set comparison mode flag
+        current_params["comparison_mode"] = self.wind_source == "compare"
+
+        return current_params
+
     def toggle_all_laps_selection(self):
         """Toggle selection of all laps based on current state"""
         # Check current state - count selected checkboxes
@@ -1140,6 +1206,39 @@ class GPSLapResult(QMainWindow):
         self.async_update(detect_laps=False)
 
         self.update_config_text()
+
+    def on_wind_source_changed(self):
+        """Handle wind source radio button changes"""
+        # Determine the new wind source
+        new_wind_source = "constant"  # default
+        if (
+            hasattr(self, "wind_constant_radio")
+            and self.wind_constant_radio.isChecked()
+        ):
+            new_wind_source = "constant"
+        elif hasattr(self, "wind_fit_radio") and self.wind_fit_radio.isChecked():
+            new_wind_source = "fit"
+        elif (
+            hasattr(self, "wind_compare_radio") and self.wind_compare_radio.isChecked()
+        ):
+            new_wind_source = "compare"
+
+        # Only update if the source actually changed
+        if new_wind_source != self.wind_source:
+            self.wind_source = new_wind_source
+
+            # Recreate VE worker with new parameters
+            if hasattr(self, 've_worker') and self.ve_worker:
+                try:
+                    self.ve_worker.resultReady.disconnect()
+                except (RuntimeError, TypeError):
+                    pass  # Ignore if already disconnected or connection doesn't exist
+
+            self.ve_worker = VEWorker(self.merged_data, self.get_current_params())
+            self.ve_worker.moveToThread(self.ve_thread)
+            self.ve_worker.resultReady.connect(self.on_ve_result_ready)
+
+            self.async_update(detect_laps=False)
 
     def save_results(self):
         """Save analysis results"""
